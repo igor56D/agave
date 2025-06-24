@@ -1,0 +1,30 @@
+[package]
+name = "solana-block-dag-analyzer"
+description = "Tool to fetch Solana mainnet blocks and build DAG from transactions based on account access patterns"
+version = "3.0.0"
+authors = ["Anza Maintainers <maintainers@anza.xyz>"]
+repository = "https://github.com/anza-xyz/agave"
+license = "Apache-2.0"
+homepage = "https://anza.xyz/"
+documentation = "https://docs.rs/solana-block-dag-analyzer"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
+solana-transaction = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-clock = { workspace = true }
+solana-commitment-config = { workspace = true }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+petgraph = "0.6"
+indexmap = "2.0"
+
+[[bin]]
+name = "solana-block-dag-analyzer"
+path = "src/main.rs" 
