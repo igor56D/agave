@@ -69,11 +69,11 @@ def create_efficiency_plots(df, output_dir=None):
     
     # Create a figure with multiple subplots
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('Efficiency Ratio Analysis: max(critical path, Total CUs/# tracks) / Longest Thread', fontsize=16, fontweight='bold')
+    fig.suptitle('Efficiency Ratio Analysis: max(critical path, Total CUs/# tracks) / Longest Track', fontsize=16, fontweight='bold')
     
     # 1. Histogram
     ax1.hist(efficiency_ratio, bins=50, alpha=0.7, edgecolor='black', color='skyblue')
-    ax1.set_xlabel('Efficiency Ratio (Optimal Min / Longest Thread)')
+    ax1.set_xlabel('Efficiency Ratio (Optimal Min / Longest Track)')
     ax1.set_ylabel('Number of Blocks')
     ax1.set_title('Distribution of Efficiency Ratios')
     ax1.grid(True, alpha=0.3)
