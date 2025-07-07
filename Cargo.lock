@@ -7078,6 +7078,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-block-dag-analyzer"
+version = "3.0.0"
+dependencies = [
+ "anyhow",
+ "clap 4.5.31",
+ "indexmap 2.9.0",
+ "petgraph",
+ "serde",
+ "serde_json",
+ "solana-clock",
+ "solana-commitment-config",
+ "solana-pubkey",
+ "solana-rpc-client",
+ "solana-rpc-client-api",
+ "solana-transaction",
+ "solana-transaction-status-client-types",
+ "tokio",
+]
+
+[[package]]
 name = "solana-bloom"
 version = "3.0.0"
 dependencies = [
