@@ -339,11 +339,15 @@ version = "3.0.0"
 dependencies = [
  "anyhow",
  "bincode",
- "clap 2.33.3",
+ "clap 4.5.31",
+ "csv",
  "dashmap",
+ "futures-util",
  "log",
  "rayon",
+ "reqwest 0.12.22",
  "serde",
+ "serde_json",
  "solana-accounts-db",
  "solana-clock",
  "solana-logger",
@@ -351,6 +355,7 @@ dependencies = [
  "solana-runtime",
  "tempfile",
  "tikv-jemallocator",
+ "tokio",
 ]
 
 [[package]]
