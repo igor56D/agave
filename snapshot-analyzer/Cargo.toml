@@ -1,0 +1,33 @@
+[package]
+name = "agave-snapshot-analyzer"
+description = "CLI tool to analyze Solana snapshot account staleness using pre-built access index"
+documentation = "https://docs.rs/agave-snapshot-analyzer"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "agave-snapshot-analyzer"
+path = "src/main.rs"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+clap = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+solana-clock = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-runtime = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-logger = "=2.3.1"
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
+jemallocator = { workspace = true } 

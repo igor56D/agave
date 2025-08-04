@@ -143,6 +143,7 @@ members = [
     "zk-keygen",
     "zk-sdk",
     "zk-token-sdk",
+    "snapshot-analyzer",
 ]
 
 exclude = ["programs/sbf", "svm/examples", "svm/tests/example-programs"]
