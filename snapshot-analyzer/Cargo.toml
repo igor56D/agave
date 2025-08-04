@@ -28,6 +28,8 @@ solana-accounts-db = { workspace = true }
 solana-logger = "=2.3.1"
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+dashmap = { workspace = true }
+rayon = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true } 

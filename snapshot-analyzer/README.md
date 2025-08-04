@@ -53,15 +53,46 @@ cargo build --release
     --current-slot 275000000
 ```
 
+### Controlling Thread Count
+
+You can control the number of threads used for parallel processing in several ways:
+
+**1. Command Line Option (Recommended):**
+```bash
+# Use 8 threads
+./target/release/agave-snapshot-analyzer --threads 8 --snapshot ... --index ...
+
+# Use 1 thread (disable parallelism)  
+./target/release/agave-snapshot-analyzer -j 1 --snapshot ... --index ...
+```
+
+**2. Environment Variable:**
+```bash
+# Set globally for the process
+export RAYON_NUM_THREADS=16
+./target/release/agave-snapshot-analyzer --snapshot ... --index ...
+```
+
+**3. Default Behavior:**
+- Uses all available CPU cores if no thread count is specified
+- Automatically detects the number of logical cores on your system
+
 ### Command Line Options
 
 - `--snapshot PATH`: Path to the snapshot archive file (required)
 - `--index PATH`: Path to the bincode account access index file (required)  
 - `--current-slot SLOT`: Current slot number (can be auto-detected from filename)
+- `--threads NUM` or `-j NUM`: Number of threads for parallel processing (default: number of CPU cores)
 
 ## Example Output
 
 ```
+INFO  [agave_snapshot_analyzer] Using default thread pool with 16 threads
+INFO  [agave_snapshot_analyzer] Calculating total snapshot size using parallel processing...
+INFO  [agave_snapshot_analyzer] Total snapshot size calculated in 0.85s
+INFO  [agave_snapshot_analyzer] Building account map from 2,150,000 accounts using parallel processing...
+INFO  [agave_snapshot_analyzer] Built account map with 2,150,000 entries in 1.23s
+
 === Solana Account Staleness Analysis ===
 
 Total snapshot size: 456.78 GB
@@ -88,8 +119,26 @@ Data older than 8 months = Total snapshot size - 8 months checkpoint
 
 - **Memory Usage**: Scales with snapshot size + index size (typically 1-10 GB RAM)
 - **Disk I/O**: Sequential reads of snapshot and index files
-- **Processing Speed**: Very fast - simple iteration and HashMap lookups
+- **Processing Speed**: Very fast - parallel processing with DashMap and rayon
 - **Storage**: Requires snapshot file + pre-built index file
+- **Threading**: Parallel account map building and size calculations
+
+### Thread Count Recommendations
+
+- **Default (auto)**: Good for most cases - uses all CPU cores
+- **High-memory systems**: Consider reducing threads if memory usage is too high
+- **I/O-bound systems**: More threads may not help if disk is the bottleneck
+- **Debugging**: Use `--threads 1` to disable parallelism for easier debugging
+- **Benchmarking**: Try different thread counts to find optimal performance for your hardware
+
+Example performance impact:
+```bash
+# Single-threaded (baseline)
+time ./agave-snapshot-analyzer -j 1 --snapshot ... --index ...
+
+# Multi-threaded (should be faster)
+time ./agave-snapshot-analyzer -j 8 --snapshot ... --index ...
+```
 
 ## Technical Notes
 
