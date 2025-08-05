@@ -5,7 +5,6 @@ use {
     clap::{Parser, Subcommand},
     csv::Writer,
     dashmap::DashMap,
-    futures_util::{stream, StreamExt},
     log::*,
     rayon::prelude::*,
     reqwest::Client,
@@ -19,10 +18,10 @@ use {
         fs::File,
         io::{BufReader, BufWriter},
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::Duration,
     },
-    tokio::{sync::Semaphore, time::sleep},
+    tokio::{task::JoinSet, time::sleep},
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
@@ -94,12 +93,8 @@ enum Commands {
         #[arg(long, short = 'j')]
         threads: Option<usize>,
         
-        /// Maximum concurrent RPC requests
+        /// Delay between RPC requests in milliseconds (per thread)
         #[arg(long, default_value = "50")]
-        max_concurrent: usize,
-        
-        /// Delay between RPC requests in milliseconds
-        #[arg(long, default_value = "10")]
         request_delay_ms: u64,
     },
 }
@@ -393,7 +388,6 @@ async fn run_block_usage_analysis(
     rpc_url: String,
     output: PathBuf,
     threads: Option<usize>,
-    max_concurrent: usize,
     request_delay_ms: u64,
 ) -> Result<()> {
     configure_thread_pool(threads)?;
@@ -405,8 +399,7 @@ async fn run_block_usage_analysis(
     info!("Starting block usage analysis for slots {} to {}", start_slot, end_slot);
     info!("RPC URL: {}", rpc_url);
     info!("Output file: {}", output.display());
-    info!("Max concurrent requests: {}", max_concurrent);
-    info!("Request delay: {}ms", request_delay_ms);
+    info!("Request delay: {}ms per thread", request_delay_ms);
 
     // Load snapshot accounts
     info!("Loading snapshot data...");
@@ -431,9 +424,12 @@ async fn run_block_usage_analysis(
     info!("Built account map with {} entries in {:.2}s", 
           account_map.len(), start_time.elapsed().as_secs_f64());
 
+    // Determine thread count for processing and HTTP client configuration
+    let num_threads = threads.unwrap_or_else(|| rayon::current_num_threads());
+
     // Create HTTP client with connection pooling
     let client = Client::builder()
-        .pool_max_idle_per_host(max_concurrent)
+        .pool_max_idle_per_host(num_threads * 2) // 2x threads for connection pooling
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create HTTP client")?;
@@ -446,44 +442,80 @@ async fn run_block_usage_analysis(
     // Write CSV header
     csv_writer.write_record(&["slot", "bytes_loaded"])?;
 
-    // Process slots concurrently
+    // Split slot range into chunks for thread-based processing
     let total_slots = end_slot - start_slot + 1;
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let chunk_size = (total_slots as usize / num_threads).max(1);
+    
+    info!("Processing {} slots across {} threads (chunk size: {})", total_slots, num_threads, chunk_size);
+    info!("Request delay: {}ms between requests", request_delay_ms);
+
     let client = Arc::new(client);
     let account_map = Arc::new(account_map);
     let rpc_url = Arc::new(rpc_url);
     let delay = Duration::from_millis(request_delay_ms);
 
-    info!("Processing {} slots with up to {} concurrent requests...", total_slots, max_concurrent);
+    // Create chunks of slots to process
+    let mut slot_chunks = Vec::new();
+    let mut current_start = start_slot;
+    
+    while current_start <= end_slot {
+        let current_end = (current_start + chunk_size as u64 - 1).min(end_slot);
+        slot_chunks.push((current_start, current_end));
+        current_start = current_end + 1;
+    }
 
-    // Create a stream of slot processing tasks
-    let slot_results = stream::iter(start_slot..=end_slot)
-        .map(|slot| {
-            let semaphore = semaphore.clone();
-            let client = client.clone();
-            let account_map = account_map.clone();
-            let rpc_url = rpc_url.clone();
+    info!("Created {} chunks for processing", slot_chunks.len());
+
+    // Shared results storage
+    let results = Arc::new(Mutex::new(Vec::<(Slot, Result<u64>)>::new()));
+    
+    // Process chunks in parallel using JoinSet
+    let mut join_set = JoinSet::new();
+    
+    for (chunk_start, chunk_end) in slot_chunks {
+        let client = client.clone();
+        let account_map = account_map.clone();
+        let rpc_url = rpc_url.clone();
+        let results = results.clone();
+        
+        join_set.spawn(async move {
+            let mut chunk_results = Vec::new();
             
-            async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                
+            for slot in chunk_start..=chunk_end {
                 // Add delay to respect rate limits
                 if request_delay_ms > 0 {
                     sleep(delay).await;
                 }
                 
                 let result = analyze_block_usage(&client, slot, &account_map, &rpc_url).await;
-                (slot, result)
+                chunk_results.push((slot, result));
             }
-        })
-        .buffer_unordered(max_concurrent);
+            
+            // Add chunk results to shared storage
+            let mut results_guard = results.lock().unwrap();
+            results_guard.extend(chunk_results);
+            
+            chunk_end - chunk_start + 1 // Return number of slots processed
+        });
+    }
 
-    // Collect results and sort by slot for ordered CSV output
-    let mut all_results: Vec<(Slot, Result<u64>)> = slot_results.collect().await;
+    // Wait for all chunks to complete and track progress
+    let mut total_processed = 0;
+    while let Some(result) = join_set.join_next().await {
+        let slots_processed = result.context("Task panicked")?;
+        total_processed += slots_processed;
+        
+        info!("Processed {}/{} slots ({:.1}%)", total_processed, total_slots, 
+              (total_processed as f64 / total_slots as f64) * 100.0);
+    }
+
+    // Sort results by slot and write to CSV
+    let mut all_results = {
+        let mut results_guard = results.lock().unwrap();
+        std::mem::take(&mut *results_guard)
+    };
     all_results.sort_by_key(|(slot, _)| *slot);
 
-    // Write results to CSV
-    let mut processed = 0;
     for (slot, result) in all_results {
         match result {
             Ok(bytes_loaded) => {
@@ -493,12 +525,6 @@ async fn run_block_usage_analysis(
                 warn!("Failed to analyze slot {}: {}. Writing 0 bytes.", slot, e);
                 csv_writer.write_record(&[slot.to_string(), "0".to_string()])?;
             }
-        }
-
-        processed += 1;
-        if processed % 100 == 0 || processed == total_slots {
-            info!("Processed {}/{} slots ({:.1}%)", processed, total_slots, 
-                  (processed as f64 / total_slots as f64) * 100.0);
         }
     }
 
@@ -608,8 +634,8 @@ async fn main() -> Result<()> {
         Commands::Staleness { snapshot, index, current_slot, threads } => {
             run_staleness_analysis(snapshot, index, current_slot, threads).await
         },
-        Commands::BlockUsage { snapshot, start_slot, end_slot, rpc_url, output, threads, max_concurrent, request_delay_ms } => {
-            run_block_usage_analysis(snapshot, start_slot, end_slot, rpc_url, output, threads, max_concurrent, request_delay_ms).await
+        Commands::BlockUsage { snapshot, start_slot, end_slot, rpc_url, output, threads, request_delay_ms } => {
+            run_block_usage_analysis(snapshot, start_slot, end_slot, rpc_url, output, threads, request_delay_ms).await
         },
     }
 } 

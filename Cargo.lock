@@ -342,7 +342,6 @@ dependencies = [
  "clap 4.5.31",
  "csv",
  "dashmap",
- "futures-util",
  "log",
  "rayon",
  "reqwest 0.12.22",

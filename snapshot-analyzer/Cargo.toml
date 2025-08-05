@@ -34,7 +34,6 @@ rayon = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { workspace = true }
 csv = { workspace = true }
-futures-util = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true } 

@@ -130,8 +130,7 @@ export RAYON_NUM_THREADS=16
 - `--rpc-url URL`: RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
 - `--output PATH` or `-o PATH`: Output CSV file path (default: block-usage.csv)
 - `--threads NUM` or `-j NUM`: Number of threads for parallel processing (default: number of CPU cores)
-- `--max-concurrent NUM`: Maximum concurrent RPC requests (default: 50)
-- `--request-delay-ms NUM`: Delay between RPC requests in milliseconds (default: 10)
+- `--request-delay-ms NUM`: Delay between RPC requests in milliseconds per thread (default: 50)
 
 ## Example Output
 
@@ -189,22 +188,30 @@ Example analysis:
     --end-slot 275001000 \
     --output my-analysis.csv
 
-# Use a local RPC endpoint with high concurrency
+# Use a local RPC endpoint with multiple threads
 ./target/release/agave-snapshot-analyzer block-usage \
     --snapshot snapshot-270000000-hash.tar.zst \
     --start-slot 275000000 \
     --end-slot 275000100 \
     --rpc-url http://localhost:8899 \
-    --max-concurrent 100 \
-    --request-delay-ms 5
+    --threads 8 \
+    --request-delay-ms 20
 
 # Conservative settings for public RPC endpoints
 ./target/release/agave-snapshot-analyzer block-usage \
     --snapshot snapshot-270000000-hash.tar.zst \
     --start-slot 275000000 \
     --end-slot 275001000 \
-    --max-concurrent 20 \
-    --request-delay-ms 50
+    --threads 2 \
+    --request-delay-ms 100
+
+# Very conservative for rate-limited endpoints
+./target/release/agave-snapshot-analyzer block-usage \
+    --snapshot snapshot-270000000-hash.tar.zst \
+    --start-slot 275000000 \
+    --end-slot 275000500 \
+    --threads 1 \
+    --request-delay-ms 200
 ```
 
 ## Performance Characteristics
@@ -218,17 +225,18 @@ Example analysis:
 
 ### Block Usage Analysis
 - **Memory Usage**: Scales with snapshot size (typically 1-10 GB RAM for account map)
-- **Network I/O**: Concurrent RPC requests with configurable limits
-- **Processing Speed**: Much faster with concurrent processing (50x improvement over sequential)
+- **Network I/O**: Thread-based parallel RPC requests with configurable rate limiting
+- **Processing Speed**: Much faster with parallel processing, respects rate limits per thread
 - **Storage**: Requires snapshot file + output CSV file
-- **Threading**: Parallel account map building, concurrent RPC requests
+- **Threading**: Parallel account map building, chunked slot processing across threads
 - **RPC Considerations**: Use local RPC node for better performance
 
-#### Concurrency Tuning
-- **Local RPC node**: Use `--max-concurrent 100-200` with minimal delay
-- **Public endpoints**: Use `--max-concurrent 10-50` with `--request-delay-ms 50-100`
-- **Rate limited endpoints**: Reduce concurrency and increase delay as needed
-- **High memory systems**: Can handle higher concurrency (more parallel requests)
+#### Rate Limiting Strategy
+- **Thread-based approach**: Each thread processes slots sequentially with delays
+- **Local RPC node**: Use more threads (`-j 8-16`) with minimal delay (`--request-delay-ms 10-25`)
+- **Public endpoints**: Use fewer threads (`-j 2-4`) with longer delays (`--request-delay-ms 100-200`)
+- **Rate limited endpoints**: Use single thread (`-j 1`) with longer delays as needed
+- **Respectful to RPC**: Total request rate = threads × (1000/delay_ms) requests/second
 
 ### Thread Count Recommendations
 
