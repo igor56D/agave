@@ -17,7 +17,7 @@ use {
         collections::HashSet,
         fs::File,
         io::{BufReader, BufWriter},
-        path::{Path, PathBuf},
+        path::{Path, PathBuf}, time::Duration,
     },
 };
 
@@ -440,6 +440,9 @@ async fn run_block_usage_analysis(
                 csv_writer.write_record(&[slot.to_string(), "0".to_string()])?;
             }
         }
+
+        // Sleep for 1 second
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         processed += 1;
         if processed % 100 == 0 || processed == total_slots {
