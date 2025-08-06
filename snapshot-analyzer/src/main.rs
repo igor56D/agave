@@ -7,17 +7,15 @@ use {
     dashmap::DashMap,
     log::*,
     rayon::prelude::*,
-    reqwest::Client,
     serde::{Deserialize, Serialize},
-    serde_json::Value,
     snapshot_parser::SnapshotParser,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     std::{
-        collections::HashSet,
+        collections::HashMap,
         fs::File,
         io::{BufReader, BufWriter},
-        path::{Path, PathBuf}, time::Duration,
+        path::{Path, PathBuf},
     },
 };
 
@@ -64,23 +62,15 @@ enum Commands {
         #[arg(long, short = 'j')]
         threads: Option<usize>,
     },
-    /// Analyze bytes loaded per block in a slot range
+    /// Analyze bytes loaded per block using provided slot-account mapping
     BlockUsage {
         /// Path to the snapshot archive file
         #[arg(long, short = 's')]
         snapshot: PathBuf,
         
-        /// Starting slot number
-        #[arg(long)]
-        start_slot: Slot,
-        
-        /// Ending slot number
-        #[arg(long)]
-        end_slot: Slot,
-        
-        /// RPC endpoint URL
-        #[arg(long, default_value = "https://api.mainnet-beta.solana.com")]
-        rpc_url: String,
+        /// Path to bincode file containing HashMap<u64, Vec<String>> mapping slots to account lists
+        #[arg(long, short = 'f')]
+        slot_accounts_file: PathBuf,
         
         /// Output CSV file path
         #[arg(long, short = 'o', default_value = "block-usage.csv")]
@@ -155,6 +145,26 @@ fn load_account_access_index(index_path: &Path) -> Vec<AccountSlotEntry> {
     }
 
     entries
+}
+
+fn load_slot_accounts_mapping(file_path: &Path) -> Result<HashMap<u64, Vec<String>>> {
+    info!("Loading slot-accounts mapping from: {}", file_path.display());
+    
+    let file = File::open(file_path)
+        .with_context(|| format!("Failed to open slot-accounts file: {}", file_path.display()))?;
+    
+    let reader = BufReader::new(file);
+    let mapping: HashMap<u64, Vec<String>> = bincode::deserialize_from(reader)
+        .with_context(|| format!("Failed to deserialize slot-accounts mapping from: {}", file_path.display()))?;
+    
+    info!("Loaded mapping for {} slots", mapping.len());
+
+    // print out number of accounts per slot
+    for (slot, accounts) in &mapping {
+        println!("Slot {}: {} accounts", slot, accounts.len());
+    }
+    
+    Ok(mapping)
 }
 
 fn analyze_account_staleness_with_accounts(
@@ -374,23 +384,22 @@ async fn run_staleness_analysis(
     Ok(())
 }
 
-async fn run_block_usage_analysis(
+fn run_block_usage_analysis(
     snapshot: PathBuf,
-    start_slot: Slot,
-    end_slot: Slot,
-    rpc_url: String,
+    slot_accounts_file: PathBuf,
     output: PathBuf,
     threads: Option<usize>,
 ) -> Result<()> {
     configure_thread_pool(threads)?;
 
-    if start_slot > end_slot {
-        anyhow::bail!("Start slot ({}) must be less than or equal to end slot ({})", start_slot, end_slot);
-    }
-
-    info!("Starting block usage analysis for slots {} to {}", start_slot, end_slot);
-    info!("RPC URL: {}", rpc_url);
+    info!("Starting block usage analysis using slot-accounts mapping");
+    info!("Slot-accounts file: {}", slot_accounts_file.display());
     info!("Output file: {}", output.display());
+
+    // Load slot-accounts mapping
+    let slot_accounts_mapping = load_slot_accounts_mapping(&slot_accounts_file)?;
+    let total_slots = slot_accounts_mapping.len();
+    info!("Loaded mapping for {} slots", total_slots);
 
     // Load snapshot accounts
     info!("Loading snapshot data...");
@@ -415,9 +424,6 @@ async fn run_block_usage_analysis(
     info!("Built account map with {} entries in {:.2}s", 
           account_map.len(), start_time.elapsed().as_secs_f64());
 
-    // Create HTTP client
-    let client = Client::new();
-
     // Create CSV writer
     let output_file = File::create(&output)
         .with_context(|| format!("Failed to create output file: {}", output.display()))?;
@@ -426,23 +432,19 @@ async fn run_block_usage_analysis(
     // Write CSV header
     csv_writer.write_record(&["slot", "bytes_loaded"])?;
 
-    // Process each slot
-    let total_slots = end_slot - start_slot + 1;
+    // Process each slot from the mapping
     let mut processed = 0;
+    let mut sorted_slots: Vec<_> = slot_accounts_mapping.keys().collect();
+    sorted_slots.sort();
 
-    for slot in start_slot..=end_slot {
-        match analyze_block_usage(&client, slot, &account_map, &rpc_url).await {
-            Ok(bytes_loaded) => {
-                csv_writer.write_record(&[slot.to_string(), bytes_loaded.to_string()])?;
-            }
-            Err(e) => {
-                warn!("Failed to analyze slot {}: {}. Writing 0 bytes.", slot, e);
-                csv_writer.write_record(&[slot.to_string(), "0".to_string()])?;
-            }
+    for &slot in &sorted_slots {
+        if let Some(account_strings) = slot_accounts_mapping.get(&slot) {
+            let bytes_loaded = analyze_slot_usage(&account_map, account_strings);
+            csv_writer.write_record(&[slot.to_string(), bytes_loaded.to_string()])?;
+        } else {
+            warn!("No account data found for slot {}", slot);
+            csv_writer.write_record(&[slot.to_string(), "0".to_string()])?;
         }
-
-        // Sleep for 1 second
-        tokio::time::sleep(Duration::from_secs(1)).await;
 
         processed += 1;
         if processed % 100 == 0 || processed == total_slots {
@@ -457,95 +459,23 @@ async fn run_block_usage_analysis(
     Ok(())
 }
 
-async fn analyze_block_usage(
-    client: &Client,
-    slot: Slot,
-    account_map: &DashMap<Pubkey, u64>,
-    rpc_url: &str,
-) -> Result<u64> {
-    // Fetch block data from RPC
-    let block_data = fetch_block_data(client, slot, rpc_url).await?;
-    
-    // Extract account references from the block
-    let account_refs = extract_account_references(&block_data)?;
-    
-    // Calculate total bytes loaded
+fn analyze_slot_usage(account_map: &DashMap<Pubkey, u64>, account_strings: &[String]) -> u64 {
     let mut total_bytes = 0u64;
-    for account_key in account_refs {
-        if let Some(account_size_ref) = account_map.get(&account_key) {
-            total_bytes += *account_size_ref;
+    
+    for account_string in account_strings {
+        if let Ok(pubkey) = account_string.parse::<Pubkey>() {
+            if let Some(account_size_ref) = account_map.get(&pubkey) {
+                total_bytes += *account_size_ref;
+            }
+        } else {
+            warn!("Failed to parse account string as Pubkey: {}", account_string);
         }
     }
     
-    Ok(total_bytes)
+    total_bytes
 }
 
-async fn fetch_block_data(client: &Client, slot: Slot, rpc_url: &str) -> Result<Value> {
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBlock",
-        "params": [
-            slot,
-            {
-                "encoding": "json",
-                "transactionDetails": "full",
-                "rewards": false,
-                "maxSupportedTransactionVersion": 0
-            }
-        ]
-    });
 
-    let response = client
-        .post(rpc_url)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .with_context(|| format!("Failed to send RPC request for slot {}", slot))?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("RPC request failed with status: {}", response.status());
-    }
-
-    let response_json: Value = response.json().await
-        .with_context(|| format!("Failed to parse RPC response for slot {}", slot))?;
-
-    if let Some(error) = response_json.get("error") {
-        anyhow::bail!("RPC error for slot {}: {}", slot, error);
-    }
-
-    response_json.get("result")
-        .ok_or_else(|| anyhow::anyhow!("No result in RPC response for slot {}", slot))
-        .map(|v| v.clone())
-}
-
-fn extract_account_references(block_data: &Value) -> Result<HashSet<Pubkey>> {
-    let mut account_refs = HashSet::new();
-
-    // Get transactions from the block
-    let transactions = block_data
-        .get("transactions")
-        .and_then(|t| t.as_array())
-        .ok_or_else(|| anyhow::anyhow!("No transactions found in block data"))?;
-
-    for transaction in transactions {
-        // Extract account keys from transaction message
-        if let Some(message) = transaction.get("transaction").and_then(|t| t.get("message")) {
-            if let Some(account_keys) = message.get("accountKeys").and_then(|ak| ak.as_array()) {
-                for account_key in account_keys {
-                    if let Some(key_str) = account_key.as_str() {
-                        if let Ok(pubkey) = key_str.parse::<Pubkey>() {
-                            account_refs.insert(pubkey);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(account_refs)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -557,8 +487,8 @@ async fn main() -> Result<()> {
         Commands::Staleness { snapshot, index, current_slot, threads } => {
             run_staleness_analysis(snapshot, index, current_slot, threads).await
         },
-        Commands::BlockUsage { snapshot, start_slot, end_slot, rpc_url, output, threads } => {
-            run_block_usage_analysis(snapshot, start_slot, end_slot, rpc_url, output, threads).await
+        Commands::BlockUsage { snapshot, slot_accounts_file, output, threads } => {
+            run_block_usage_analysis(snapshot, slot_accounts_file, output, threads)
         },
     }
 } 
