@@ -152,6 +152,8 @@ fn load_slot_accounts_mapping(file_path: &Path) -> Result<HashMap<u64, Vec<Strin
     
     let file = File::open(file_path)
         .with_context(|| format!("Failed to open slot-accounts file: {}", file_path.display()))?;
+
+    
     
     let reader = BufReader::new(file);
     let mapping: HashMap<u64, Vec<String>> = bincode::deserialize_from(reader)
@@ -491,4 +493,4 @@ async fn main() -> Result<()> {
             run_block_usage_analysis(snapshot, slot_accounts_file, output, threads)
         },
     }
-} 
+}
