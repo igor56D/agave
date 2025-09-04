@@ -139,19 +139,47 @@ fn calculate_epoch_boundaries(current_epoch: u16) -> [u16; 4] {
 fn load_account_activity_index(index_path: &Path) -> Vec<AccountActivityEntry> {
     info!("Loading account activity index from: {}", index_path.display());
     
-    let file = match File::open(index_path) {
-        Ok(file) => file,
+    // Use the same approach as producer: read entire file into memory first
+    let file_data = match std::fs::read(index_path) {
+        Ok(data) => {
+            info!("Successfully read {} bytes from file", data.len());
+            data
+        },
         Err(e) => {
-            warn!("Failed to open index file: {}. Using empty index.", e);
+            warn!("Failed to read index file: {}. Using empty index.", e);
             return Vec::new();
         }
     };
     
-    let reader = BufReader::new(file);
-    let entries: Vec<AccountActivityEntry> = match bincode::deserialize_from(reader) {
-        Ok(entries) => entries,
+    // Show first 16 bytes for debugging
+    if file_data.len() >= 16 {
+        info!("First 16 bytes (hex): {:02x?}", &file_data[0..16]);
+        
+        // Interpret first 8 bytes as length prefix
+        let length_bytes: [u8; 8] = file_data[0..8].try_into().unwrap();
+        let expected_length = u64::from_le_bytes(length_bytes);
+        info!("Bincode length prefix: {} entries expected", expected_length);
+        
+        // Sanity check
+        let max_reasonable_entries = 50_000_000u64;
+        if expected_length > max_reasonable_entries {
+            error!("Expected length {} is unreasonably large (> {})", expected_length, max_reasonable_entries);
+            error!("This suggests the file format is incompatible or corrupted");
+            return Vec::new();
+        }
+    } else {
+        warn!("File is too small ({} bytes) to contain valid data", file_data.len());
+        return Vec::new();
+    }
+    
+    // Now deserialize using the same approach as producer
+    let entries: Vec<AccountActivityEntry> = match bincode::deserialize::<Vec<AccountActivityEntry>>(&file_data) {
+        Ok(entries) => {
+            info!("Successfully deserialized {} entries", entries.len());
+            entries
+        },
         Err(e) => {
-            warn!("Failed to deserialize account activity index: {}. Using empty index.", e);
+            error!("Failed to deserialize account activity index: {}", e);
             return Vec::new();
         }
     };
