@@ -44,17 +44,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Analyze account staleness using pre-built access index
+    /// Analyze account staleness using pre-built activity index
     Staleness {
         /// Path to the snapshot archive file
         #[arg(long, short = 's')]
         snapshot: PathBuf,
         
-        /// Path to the bincode account access index file
+        /// Path to the bincode account activity index file
         #[arg(long, short = 'i')]
         index: PathBuf,
         
-        /// Current slot number (auto-detected from filename if not provided)
+        /// Current slot number (auto-detected from filename if not provided, converted to epoch)
         #[arg(long)]
         current_slot: Option<Slot>,
         
@@ -83,41 +83,61 @@ enum Commands {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountSlotEntry {
+pub struct AccountActivityEntry {
     pub account: Pubkey,
-    pub highest_slot: u64,
+    pub activity: AccountActivity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountActivity {
+    /// Top 10 highest epochs where this account was read from (sorted descending)
+    pub top_read_epochs: Vec<u16>,
+    /// Top 10 highest epochs where this account was written to (sorted descending) 
+    pub top_write_epochs: Vec<u16>,
+    /// Total number of read operations
+    pub read_count: u32,
+    /// Total number of write operations
+    pub write_count: u32,
 }
 
 #[derive(Debug)]
 struct StalenessCheckpoint {
     months: u32,
-    boundary_slot: u64,
+    boundary_epoch: u16,
     total_size_bytes: u64,
     total_account_count: u64,
 }
 
 impl StalenessCheckpoint {
     fn print(&self) {
-        println!("{} months ago (slot {}): {} accounts, {:.2} GB",
+        println!("{} months ago (epoch {}): {} accounts, {:.2} GB",
                  self.months,
-                 self.boundary_slot,
+                 self.boundary_epoch,
                  self.total_account_count,
                  self.total_size_bytes as f64 / 1_000_000_000.0);
     }
 }
 
-fn calculate_slot_boundaries(current_slot: Slot) -> [Slot; 4] {
-    let slots_per_month = (SECONDS_PER_MONTH * SOLANA_SLOTS_PER_SECOND) as u64;
+// Solana epoch constants
+const SOLANA_SLOTS_PER_EPOCH: u64 = 432_000; // Approximate slots per epoch on mainnet
+
+fn slot_to_epoch(slot: Slot) -> u16 {
+    (slot / SOLANA_SLOTS_PER_EPOCH) as u16
+}
+
+fn calculate_epoch_boundaries(current_epoch: u16) -> [u16; 4] {
+    let epochs_per_month = (SECONDS_PER_MONTH * SOLANA_SLOTS_PER_SECOND / SOLANA_SLOTS_PER_EPOCH as f64) as u16;
+    
     [
-        current_slot.saturating_sub(slots_per_month),     // 1 month
-        current_slot.saturating_sub(2 * slots_per_month), // 2 months
-        current_slot.saturating_sub(4 * slots_per_month), // 4 months
-        current_slot.saturating_sub(8 * slots_per_month), // 8 months
+        current_epoch.saturating_sub(epochs_per_month),     // 1 month
+        current_epoch.saturating_sub(2 * epochs_per_month), // 2 months
+        current_epoch.saturating_sub(4 * epochs_per_month), // 4 months
+        current_epoch.saturating_sub(8 * epochs_per_month), // 8 months
     ]
 }
 
-fn load_account_access_index(index_path: &Path) -> Vec<AccountSlotEntry> {
-    info!("Loading account access index from: {}", index_path.display());
+fn load_account_activity_index(index_path: &Path) -> Vec<AccountActivityEntry> {
+    info!("Loading account activity index from: {}", index_path.display());
     
     let file = match File::open(index_path) {
         Ok(file) => file,
@@ -128,20 +148,35 @@ fn load_account_access_index(index_path: &Path) -> Vec<AccountSlotEntry> {
     };
     
     let reader = BufReader::new(file);
-    let entries: Vec<AccountSlotEntry> = match bincode::deserialize_from(reader) {
+    let entries: Vec<AccountActivityEntry> = match bincode::deserialize_from(reader) {
         Ok(entries) => entries,
         Err(e) => {
-            warn!("Failed to deserialize account access index: {}. Using empty index.", e);
+            warn!("Failed to deserialize account activity index: {}. Using empty index.", e);
             return Vec::new();
         }
     };
     
-    info!("Loaded {} account access entries", entries.len());
+    info!("Loaded {} account activity entries", entries.len());
     
-    // Verify the entries are sorted from high to low slot
-    if let Some(windows) = entries.windows(2).find(|w| w[0].highest_slot < w[1].highest_slot) {
-        warn!("Index may not be properly sorted: slot {} follows slot {}", 
-              windows[0].highest_slot, windows[1].highest_slot);
+    // Verify the entries are sorted by most recent activity (highest epoch in either read or write)
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            let prev_entry = &entries[i - 1];
+            let prev_max_epoch = prev_entry.activity.top_read_epochs.first()
+                .copied()
+                .unwrap_or(0)
+                .max(prev_entry.activity.top_write_epochs.first().copied().unwrap_or(0));
+            let curr_max_epoch = entry.activity.top_read_epochs.first()
+                .copied()
+                .unwrap_or(0)
+                .max(entry.activity.top_write_epochs.first().copied().unwrap_or(0));
+            
+            if curr_max_epoch > prev_max_epoch {
+                warn!("Index may not be properly sorted: epoch {} follows epoch {} at index {}", 
+                      curr_max_epoch, prev_max_epoch, i);
+                break;
+            }
+        }
     }
 
     entries
@@ -171,11 +206,10 @@ fn load_slot_accounts_mapping(file_path: &Path) -> Result<HashMap<u64, Vec<Strin
 
 fn analyze_account_staleness_with_accounts(
     snapshot_accounts: Vec<snapshot_parser::AccountInfo>,
-    index_path: &Path,
+    access_entries: Vec<AccountActivityEntry>,
     current_slot: Slot,
 ) -> Result<Vec<StalenessCheckpoint>> {
     info!("Starting account staleness analysis");
-    info!("Index: {}", index_path.display());
     info!("Current slot: {}", current_slot);
 
     // Step 1: Build account map from pre-loaded snapshot accounts
@@ -191,16 +225,14 @@ fn analyze_account_staleness_with_accounts(
     info!("Built account map with {} entries in {:.2}s", 
           account_map.len(), start.elapsed().as_secs_f64());
 
-    // Step 2: Load account access index
-    let access_entries = load_account_access_index(index_path);
-
-    // Step 3: Calculate time boundaries
-    let slot_boundaries = calculate_slot_boundaries(current_slot);
-    info!("Time boundaries (slots): {:?}", slot_boundaries);
+    // Step 2: Calculate time boundaries (using pre-loaded access entries)
+    let current_epoch = slot_to_epoch(current_slot);
+    let epoch_boundaries = calculate_epoch_boundaries(current_epoch);
+    info!("Current epoch: {}, Time boundaries (epochs): {:?}", current_epoch, epoch_boundaries);
     
     let boundary_months = [1, 2, 4, 8];
     
-    // Step 4: Process entries and track checkpoints
+    // Step 3: Process entries and track checkpoints
     let mut checkpoints = Vec::new();
     let mut total_size = 0u64;
     let mut total_account_count = 0u64;
@@ -215,21 +247,27 @@ fn analyze_account_staleness_with_accounts(
             total_account_count += 1;
         }
         
+        // Get the most recent activity epoch for this account
+        let most_recent_epoch = entry.activity.top_read_epochs.first()
+            .copied()
+            .unwrap_or(0)
+            .max(entry.activity.top_write_epochs.first().copied().unwrap_or(0));
+        
         // Check if we've crossed any time boundaries
-        while boundary_index < slot_boundaries.len() && 
-              entry.highest_slot <= slot_boundaries[boundary_index] {
+        while boundary_index < epoch_boundaries.len() && 
+              most_recent_epoch <= epoch_boundaries[boundary_index] {
             
             let checkpoint = StalenessCheckpoint {
                 months: boundary_months[boundary_index],
-                boundary_slot: slot_boundaries[boundary_index],
+                boundary_epoch: epoch_boundaries[boundary_index],
                 total_size_bytes: total_size,
                 total_account_count,
             };
             
-            info!("Checkpoint: {} months - {} GB at slot {} (entry {}/{})",
+            info!("Checkpoint: {} months - {} GB at epoch {} (entry {}/{})",
                   checkpoint.months,
                   checkpoint.total_size_bytes as f64 / 1_000_000_000.0,
-                  checkpoint.boundary_slot,
+                  checkpoint.boundary_epoch,
                   i + 1,
                   access_entries.len());
             
@@ -238,7 +276,7 @@ fn analyze_account_staleness_with_accounts(
         }
         
         // Early exit if we've processed all boundaries
-        if boundary_index >= slot_boundaries.len() {
+        if boundary_index >= epoch_boundaries.len() {
             break;
         }
         
@@ -253,10 +291,10 @@ fn analyze_account_staleness_with_accounts(
     }
 
     // Add final checkpoint if we haven't reached 8 months yet
-    if boundary_index < slot_boundaries.len() {
+    if boundary_index < epoch_boundaries.len() {
         let checkpoint = StalenessCheckpoint {
             months: 8,
-            boundary_slot: slot_boundaries[3],
+            boundary_epoch: epoch_boundaries[3],
             total_size_bytes: total_size,
             total_account_count,
         };
@@ -324,6 +362,39 @@ async fn run_staleness_analysis(
         warn!("Could not determine current slot. Using default slot 0. Consider providing --current-slot.");
         0
     };
+    
+    let current_epoch = slot_to_epoch(current_slot);
+    info!("Current slot: {}, Current epoch: {}", current_slot, current_epoch);
+
+    // Load account activity index first for debugging
+    info!("Loading account activity index for debugging...");
+    let access_entries = load_account_activity_index(&index);
+    println!("📊 Loaded {} account activity entries from index", access_entries.len());
+    
+    // Show some statistics about the loaded index
+    if !access_entries.is_empty() {
+        let total_reads: u64 = access_entries.iter().map(|e| e.activity.read_count as u64).sum();
+        let total_writes: u64 = access_entries.iter().map(|e| e.activity.write_count as u64).sum();
+        let accounts_with_reads = access_entries.iter().filter(|e| e.activity.read_count > 0).count();
+        let accounts_with_writes = access_entries.iter().filter(|e| e.activity.write_count > 0).count();
+        
+        println!("📈 Index statistics:");
+        println!("   - Accounts with read activity: {}", accounts_with_reads);
+        println!("   - Accounts with write activity: {}", accounts_with_writes);
+        println!("   - Total read operations: {}", total_reads);
+        println!("   - Total write operations: {}", total_writes);
+        
+        // Show epoch range
+        let mut all_epochs = Vec::new();
+        for entry in &access_entries {
+            all_epochs.extend_from_slice(&entry.activity.top_read_epochs);
+            all_epochs.extend_from_slice(&entry.activity.top_write_epochs);
+        }
+        if !all_epochs.is_empty() {
+            all_epochs.sort_unstable();
+            println!("   - Epoch range: {} to {}", all_epochs.first().unwrap_or(&0), all_epochs.last().unwrap_or(&0));
+        }
+    }
 
     // Calculate total snapshot size and analyze staleness
     let mut parser = SnapshotParser::new(&snapshot);
@@ -341,7 +412,7 @@ async fn run_staleness_analysis(
     let total_snapshot_accounts = snapshot_accounts.len() as u64;
     info!("Total snapshot size calculated in {:.2}s", start.elapsed().as_secs_f64());
     
-    let checkpoints = match analyze_account_staleness_with_accounts(snapshot_accounts, &index, current_slot) {
+    let checkpoints = match analyze_account_staleness_with_accounts(snapshot_accounts, access_entries, current_slot) {
         Ok(checkpoints) => checkpoints,
         Err(e) => {
             warn!("Failed to analyze account staleness: {}. Using empty results.", e);
@@ -351,17 +422,17 @@ async fn run_staleness_analysis(
     
     println!("\n=== Solana Account Staleness Analysis ===\n");
     println!("Total snapshot: {} accounts, {:.2} GB", total_snapshot_accounts, total_snapshot_size as f64 / 1_000_000_000.0);
-    println!("Using pre-built account access index");
-    println!("Analysis based on cumulative account sizes by access recency\n");
+    println!("Using pre-built account activity index");
+    println!("Analysis based on cumulative account sizes by epoch-based activity recency\n");
     
     if checkpoints.is_empty() {
         println!("⚠️  No checkpoints found - this may be due to:");
         println!("   - Missing or empty snapshot file");
         println!("   - Missing or empty index file");
         println!("   - Data processing errors (see warnings above)");
-        println!("   - All accounts accessed more recently than 8 months");
+        println!("   - All accounts have activity more recent than 8 months");
     } else {
-        println!("Checkpoints (accounts accessed within each time period):");
+        println!("Checkpoints (accounts with activity within each time period):");
         println!("{}", "-".repeat(70));
         
         for checkpoint in &checkpoints {
