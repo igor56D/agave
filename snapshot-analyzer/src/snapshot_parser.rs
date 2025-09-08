@@ -1,25 +1,16 @@
 use {
     log::*,
-    solana_accounts_db::{
-        accounts_file::StorageAccess,
-        accounts_db::AccountStorageEntry,
-    },
-    solana_clock::Slot,
+    solana_account::ReadableAccount,
     solana_pubkey::Pubkey,
     solana_runtime::{
+        genesis_utils::create_genesis_config,
+        runtime_config::RuntimeConfig,
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
-        snapshot_utils::verify_and_unarchive_snapshots,
+        snapshot_bank_utils::bank_from_snapshot_archives,
     },
-    std::{
-        path::PathBuf,
-    },
+    std::{collections::HashMap, path::PathBuf, sync::{atomic::AtomicBool, Arc}},
 };
 
-#[derive(Debug, Clone)]
-pub struct AccountInfo {
-    pub pubkey: Pubkey,
-    pub data_len: u64,
-}
 
 pub struct SnapshotParser {
     pub snapshot_path: PathBuf,
@@ -34,17 +25,11 @@ impl SnapshotParser {
         }
     }
 
-    pub fn parse_accounts(&mut self) -> Result<Vec<AccountInfo>, Box<dyn std::error::Error>> {
-        info!("Parsing snapshot: {}", self.snapshot_path.display());
+    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<(HashMap<Pubkey, u64>, usize, u64), Box<dyn std::error::Error>> {
+        info!("Loading Bank from snapshot: {}", self.snapshot_path.display());
         
-        // Check if this is a full snapshot archive
-        let archive_info = match FullSnapshotArchiveInfo::new_from_path(self.snapshot_path.clone()) {
-            Ok(info) => info,
-            Err(e) => {
-                return Err(format!("Failed to parse snapshot archive info: {}", e).into());
-            }
-        };
-
+        // Parse the snapshot archive info
+        let archive_info = FullSnapshotArchiveInfo::new_from_path(self.snapshot_path.clone())?;
         info!("Found snapshot with slot: {}", archive_info.slot());
 
         // Create temporary directory for unpacking
@@ -58,54 +43,71 @@ impl SnapshotParser {
             std::fs::create_dir_all(path)?;
         }
 
-        info!("Unpacking snapshot to temporary directory...");
+        // Create a minimal genesis config
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let runtime_config = RuntimeConfig::default();
+        let exit = Arc::new(AtomicBool::new(false));
+
+        info!("Reconstructing Bank from snapshot...");
         
-        // Unarchive the snapshot
-        let (unarchived_snapshots, _guard) = verify_and_unarchive_snapshots(
+        // Reconstruct the bank from the snapshot
+        let (bank, _timings) = bank_from_snapshot_archives(
+            &account_paths,
             &bank_snapshots_dir,
             &archive_info,
             None, // No incremental snapshot
-            &account_paths,
-            StorageAccess::File,
+            &genesis_config,
+            &runtime_config,
+            None, // debug_keys
+            None, // additional_builtins
+            None, // limit_load_slot_count_from_snapshot
+            false, // test_hash_calculation
+            false, // accounts_db_skip_shrink
+            false, // accounts_db_force_initial_clean
+            true,  // verify_index
+            None,  // accounts_db_config
+            None,  // accounts_update_notifier
+            exit,
         )?;
 
-        info!("Snapshot unpacked successfully, analyzing accounts...");
+        info!("Bank reconstructed, getting aggregate stats efficiently...");
 
-        // Now we need to parse the account files from the unarchived storage
-        let mut accounts = Vec::new();
-        
-        // Iterate through the full storage map using proper DashMap iteration
-        for entry in unarchived_snapshots.full_storage.iter() {
-            let slot = *entry.key();
-            let storage_entry = entry.value();
-            debug!("Processing storage for slot: {}", slot);
-            accounts.extend(self.parse_storage_entry(storage_entry, slot)?);
+        // Get total counts efficiently using Bank's built-in stats
+        let total_stats = bank.get_total_accounts_stats()?;
+        let total_accounts = total_stats.num_accounts;
+        let total_bytes = total_stats.data_len as u64;
+
+        info!("Total accounts: {}, total bytes: {}", total_accounts, total_bytes);
+        info!("Querying only tracked accounts...");
+
+        // Only query the accounts we care about
+        let mut tracked_accounts = HashMap::new();
+        let mut tracked_bytes = 0u64;
+
+        for pubkey in activity_map.keys() {
+            if let Some(account) = bank.get_account(pubkey) {
+                let data_len = account.data().len() as u64;
+                tracked_accounts.insert(*pubkey, data_len);
+                tracked_bytes += data_len;
+            }
         }
+
+        // Calculate untracked stats by subtraction
+        let untracked_count = total_accounts - tracked_accounts.len();
+        let untracked_bytes = total_bytes - tracked_bytes;
 
         // Store temp_dir to keep it alive
         self.temp_dir = Some(temp_dir);
 
-        info!("Parsed {} accounts from snapshot", accounts.len());
-        Ok(accounts)
+        info!(
+            "Parsed {} tracked accounts ({} bytes), {} untracked accounts ({} bytes)", 
+            tracked_accounts.len(), 
+            tracked_bytes,
+            untracked_count,
+            untracked_bytes
+        );
+        
+        Ok((tracked_accounts, untracked_count, untracked_bytes))
     }
-
-    fn parse_storage_entry(&self, storage_entry: &AccountStorageEntry, slot: Slot) -> Result<Vec<AccountInfo>, Box<dyn std::error::Error>> {
-        debug!("Parsing storage entry for slot: {}", slot);
-        
-        let mut accounts = Vec::new();
-        
-        // Use the storage entry's accounts scan method with proper callback signature
-        storage_entry.accounts.scan_accounts(|_offset, account| {
-            let account_info = AccountInfo {
-                pubkey: *account.pubkey,
-                data_len: account.data.len() as u64,
-            };
-            
-            accounts.push(account_info);
-        })?;
-        
-        Ok(accounts)
-    }
-
 
 } 

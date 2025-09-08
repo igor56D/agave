@@ -4,15 +4,11 @@ use {
     anyhow::Result,
     clap::{Parser, Subcommand},
     log::*,
-    rayon::prelude::*,
     rusqlite::Connection,
     serde::{Deserialize, Serialize},
     snapshot_parser::SnapshotParser,
     solana_pubkey::Pubkey,
-    std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-    },
+    std::{collections::HashMap, path::{Path, PathBuf}},
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
@@ -132,25 +128,24 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
             max_write_epoch INTEGER,
             total_activity_count INTEGER
         );
+        
+        CREATE TABLE untracked_accounts_summary (
+            total_count INTEGER,
+            total_bytes INTEGER
+        );
     "#)?;
     
     // Load and insert data
     info!("Loading account activity index...");
-    let activity_entries = load_account_activity_index(&index);
-    if activity_entries.is_empty() {
+    let activity_map = load_account_activity_index(&index);
+    if activity_map.is_empty() {
         return Err(anyhow::anyhow!("No activity entries loaded"));
     }
     
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let snapshot_accounts = parser.parse_accounts()
+    let (account_sizes, untracked_count, untracked_bytes) = parser.parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
-    
-    // Build account size lookup
-    let account_sizes: HashMap<Pubkey, u64> = snapshot_accounts
-        .into_par_iter()
-        .map(|acc| (acc.pubkey, acc.data_len))
-        .collect();
     
     info!("Inserting data into database...");
     
@@ -164,25 +159,25 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
     
     let mut inserted = 0;
     
-    for entry in activity_entries {
-        if let Some(&account_size) = account_sizes.get(&entry.account) {
-            let max_read = entry.activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
-            let max_write = entry.activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
-            let total_activity = entry.activity.read_count + entry.activity.write_count;
+    for (pubkey, activity) in &activity_map {
+        if let Some(&account_size) = account_sizes.get(pubkey) {
+            let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
+            let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
+            let total_activity = activity.read_count + activity.write_count;
             
             // Convert arrays to JSON strings
-            let read_epochs_str = format!("[{}]", entry.activity.top_read_epochs.iter()
+            let read_epochs_str = format!("[{}]", activity.top_read_epochs.iter()
                 .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-            let write_epochs_str = format!("[{}]", entry.activity.top_write_epochs.iter()
+            let write_epochs_str = format!("[{}]", activity.top_write_epochs.iter()
                 .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
             
             stmt.execute((
-                &entry.account.to_string(),
+                &pubkey.to_string(),
                 account_size as i64,
                 &read_epochs_str,
                 &write_epochs_str,
-                entry.activity.read_count as i32,
-                entry.activity.write_count as i32,
+                activity.read_count as i32,
+                activity.write_count as i32,
                 max_read,
                 max_write,
                 total_activity as i32,
@@ -197,22 +192,31 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
         }
     }
     
+    // Insert untracked account summary
+    tx.execute(
+        "INSERT INTO untracked_accounts_summary (total_count, total_bytes) VALUES (?, ?)",
+        (untracked_count as i64, untracked_bytes as i64),
+    )?;
+    
     // Commit the entire transaction
     drop(stmt);
     tx.commit()?;
     
-    info!("Database created successfully with {} accounts", inserted);
+    info!(
+        "Database created successfully with {} tracked accounts and {} untracked accounts ({} bytes)", 
+        inserted, untracked_count, untracked_bytes
+    );
     Ok(())
 }
 
-fn load_account_activity_index(index_path: &Path) -> Vec<AccountActivityEntry> {
+fn load_account_activity_index(index_path: &Path) -> HashMap<Pubkey, AccountActivity> {
     info!("Loading account activity index from: {}", index_path.display());
     
     let file_data = match std::fs::read(index_path) {
         Ok(data) => data,
         Err(e) => {
-            warn!("Failed to read index file: {}. Using empty index.", e);
-            return Vec::new();
+        warn!("Failed to read index file: {}. Using empty index.", e);
+        return HashMap::new();
         }
     };
     
@@ -220,10 +224,13 @@ fn load_account_activity_index(index_path: &Path) -> Vec<AccountActivityEntry> {
         Ok(entries) => {
             info!("Loaded {} account activity entries", entries.len());
             entries
+                .into_iter()
+                .map(|entry| (entry.account, entry.activity))
+                .collect()
         },
         Err(e) => {
             error!("Failed to deserialize account activity index: {}", e);
-            Vec::new()
+            HashMap::new()
         }
     }
 }
