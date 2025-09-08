@@ -109,7 +109,15 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
     }
     
     // Create SQLite connection
-    let conn = Connection::open(&output)?;
+    let mut conn = Connection::open(&output)?;
+    
+    // Optimize SQLite for bulk inserts
+    conn.execute_batch(r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = 100000;
+        PRAGMA temp_store = MEMORY;
+    "#)?;
     
     // Create the main accounts table
     conn.execute_batch(r#"
@@ -145,11 +153,17 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
         .collect();
     
     info!("Inserting data into database...");
-    let mut stmt = conn.prepare(r#"
+    
+    // Use a single large transaction for maximum speed
+    let tx = conn.transaction()?;
+    
+    // Prepare statement once
+    let mut stmt = tx.prepare(r#"
         INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     "#)?;
     
     let mut inserted = 0;
+    
     for entry in activity_entries {
         if let Some(&account_size) = account_sizes.get(&entry.account) {
             let max_read = entry.activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
@@ -175,11 +189,17 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
             ))?;
             
             inserted += 1;
-            if inserted % 10000 == 0 {
-                info!("Inserted {} accounts", inserted);
+            
+            // Progress reporting every 50k accounts
+            if inserted % 50000 == 0 {
+                info!("Inserted {} accounts...", inserted);
             }
         }
     }
+    
+    // Commit the entire transaction
+    drop(stmt);
+    tx.commit()?;
     
     info!("Database created successfully with {} accounts", inserted);
     Ok(())
@@ -238,12 +258,31 @@ fn run_query(database: PathBuf, query: String) -> Result<()> {
         let row = row?;
         println!("{}", row.join("\t"));
     }
-    
+
     Ok(())
 }
 
 fn run_staleness_query(database: PathBuf, current_epoch: Option<u16>) -> Result<()> {
-    let current_epoch = current_epoch.unwrap_or(600); // Default current epoch
+    let conn = Connection::open(&database)?;
+    
+    let current_epoch = match current_epoch {
+        Some(epoch) => epoch,
+        None => {
+            // Get the highest epoch from the database
+            let mut stmt = conn.prepare("SELECT MAX(MAX(max_read_epoch, max_write_epoch)) FROM accounts")?;
+            let max_epoch: Option<i32> = stmt.query_row([], |row| row.get(0))?;
+            match max_epoch {
+                Some(epoch) => {
+                    info!("Using highest epoch from database: {}", epoch);
+                    epoch as u16
+                },
+                None => {
+                    warn!("No epochs found in database, using default: 600");
+                    600
+                }
+            }
+        }
+    };
     
     let query = format!(r#"
         WITH staleness_buckets AS (
@@ -279,7 +318,37 @@ fn run_staleness_query(database: PathBuf, current_epoch: Option<u16>) -> Result<
     
     println!("Account Staleness Analysis (Current Epoch: {})", current_epoch);
     println!("Category\tAccounts\tTotal Bytes\tTotal GB");
-    run_query(database, query)
+    
+    // Run the query using the existing connection
+    let mut stmt = conn.prepare(&query)?;
+    let column_count = stmt.column_count();
+    
+    let rows = stmt.query_map([], |row| {
+        let mut values = Vec::new();
+        for i in 0..column_count {
+            let value: String = match row.get::<_, Option<String>>(i) {
+                Ok(Some(s)) => s,
+                Ok(None) => "NULL".to_string(),
+                Err(_) => {
+                    // Try as integer
+                    match row.get::<_, Option<i64>>(i) {
+                        Ok(Some(n)) => n.to_string(),
+                        Ok(None) => "NULL".to_string(),
+                        Err(_) => "NULL".to_string(),
+                    }
+                }
+            };
+            values.push(value);
+        }
+        Ok(values)
+    })?;
+    
+    for row in rows {
+        let row = row?;
+        println!("{}", row.join("\t"));
+    }
+
+    Ok(())
 }
 
 fn run_block_usage_query(database: PathBuf, _slot_accounts_file: PathBuf) -> Result<()> {
