@@ -139,7 +139,7 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
     
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let account_sizes = parser.parse_accounts(&activity_map)
+    let account_sizes = parser.parse_accounts(&activity_map).await
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
     
     info!("Inserting data into database...");
