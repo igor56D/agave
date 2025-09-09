@@ -128,11 +128,6 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
             max_write_epoch INTEGER,
             total_activity_count INTEGER
         );
-        
-        CREATE TABLE untracked_accounts_summary (
-            total_count INTEGER,
-            total_bytes INTEGER
-        );
     "#)?;
     
     // Load and insert data
@@ -144,7 +139,7 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
     
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let (account_sizes, untracked_count, untracked_bytes) = parser.parse_accounts(&activity_map)
+    let account_sizes = parser.parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
     
     info!("Inserting data into database...");
@@ -192,20 +187,11 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
         }
     }
     
-    // Insert untracked account summary
-    tx.execute(
-        "INSERT INTO untracked_accounts_summary (total_count, total_bytes) VALUES (?, ?)",
-        (untracked_count as i64, untracked_bytes as i64),
-    )?;
-    
     // Commit the entire transaction
     drop(stmt);
     tx.commit()?;
     
-    info!(
-        "Database created successfully with {} tracked accounts and {} untracked accounts ({} bytes)", 
-        inserted, untracked_count, untracked_bytes
-    );
+    info!("Database created successfully with {} tracked accounts", inserted);
     Ok(())
 }
 

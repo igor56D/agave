@@ -1,14 +1,12 @@
 use {
     log::*,
-    solana_account::ReadableAccount,
+    solana_accounts_db::accounts_file::StorageAccess,
     solana_pubkey::Pubkey,
     solana_runtime::{
-        genesis_utils::create_genesis_config,
-        runtime_config::RuntimeConfig,
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
-        snapshot_bank_utils::bank_from_snapshot_archives,
+        snapshot_utils::verify_and_unarchive_snapshots,
     },
-    std::{collections::HashMap, path::PathBuf, sync::{atomic::AtomicBool, Arc}},
+    std::{collections::HashMap, path::PathBuf},
 };
 
 
@@ -25,8 +23,8 @@ impl SnapshotParser {
         }
     }
 
-    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<(HashMap<Pubkey, u64>, usize, u64), Box<dyn std::error::Error>> {
-        info!("Loading Bank from snapshot: {}", self.snapshot_path.display());
+    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<HashMap<Pubkey, u64>, Box<dyn std::error::Error>> {
+        info!("Parsing snapshot directly: {}", self.snapshot_path.display());
         
         // Parse the snapshot archive info
         let archive_info = FullSnapshotArchiveInfo::new_from_path(self.snapshot_path.clone())?;
@@ -43,71 +41,42 @@ impl SnapshotParser {
             std::fs::create_dir_all(path)?;
         }
 
-        // Create a minimal genesis config
-        let genesis_config = create_genesis_config(10_000).genesis_config;
-        let runtime_config = RuntimeConfig::default();
-        let exit = Arc::new(AtomicBool::new(false));
-
-        info!("Reconstructing Bank from snapshot...");
+        info!("Unpacking snapshot...");
         
-        // Reconstruct the bank from the snapshot
-        let (bank, _timings) = bank_from_snapshot_archives(
-            &account_paths,
+        // Unarchive the snapshot (this is the lightweight part)
+        let (unarchived_snapshots, _guard) = verify_and_unarchive_snapshots(
             &bank_snapshots_dir,
             &archive_info,
             None, // No incremental snapshot
-            &genesis_config,
-            &runtime_config,
-            None, // debug_keys
-            None, // additional_builtins
-            None, // limit_load_slot_count_from_snapshot
-            false, // test_hash_calculation
-            false, // accounts_db_skip_shrink
-            false, // accounts_db_force_initial_clean
-            true,  // verify_index
-            None,  // accounts_db_config
-            None,  // accounts_update_notifier
-            exit,
+            &account_paths,
+            StorageAccess::File,
         )?;
 
-        info!("Bank reconstructed, getting aggregate stats efficiently...");
+        info!("Snapshot unpacked, scanning for tracked accounts...");
 
-        // Get total counts efficiently using Bank's built-in stats
-        let total_stats = bank.get_total_accounts_stats()?;
-        let total_accounts = total_stats.num_accounts;
-        let total_bytes = total_stats.data_len as u64;
-
-        info!("Total accounts: {}, total bytes: {}", total_accounts, total_bytes);
-        info!("Querying only tracked accounts...");
-
-        // Only query the accounts we care about
+        // Scan ONLY for accounts we care about
         let mut tracked_accounts = HashMap::new();
-        let mut tracked_bytes = 0u64;
 
-        for pubkey in activity_map.keys() {
-            if let Some(account) = bank.get_account(pubkey) {
-                let data_len = account.data().len() as u64;
-                tracked_accounts.insert(*pubkey, data_len);
-                tracked_bytes += data_len;
-            }
+        for entry in unarchived_snapshots.full_storage.iter() {
+            let storage_entry = entry.value();
+            
+            // Scan this storage, but only collect accounts we care about
+            let _ = storage_entry.accounts.scan_accounts(|_offset, account| {
+                let pubkey = *account.pubkey;
+                
+                if activity_map.contains_key(&pubkey) {
+                    let data_len = account.data.len() as u64;
+                    tracked_accounts.insert(pubkey, data_len);
+                }
+            });
         }
-
-        // Calculate untracked stats by subtraction
-        let untracked_count = total_accounts - tracked_accounts.len();
-        let untracked_bytes = total_bytes - tracked_bytes;
 
         // Store temp_dir to keep it alive
         self.temp_dir = Some(temp_dir);
 
-        info!(
-            "Parsed {} tracked accounts ({} bytes), {} untracked accounts ({} bytes)", 
-            tracked_accounts.len(), 
-            tracked_bytes,
-            untracked_count,
-            untracked_bytes
-        );
+        info!("Found {} tracked accounts", tracked_accounts.len());
         
-        Ok((tracked_accounts, untracked_count, untracked_bytes))
+        Ok(tracked_accounts)
     }
 
 } 
