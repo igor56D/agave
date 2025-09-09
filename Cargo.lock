@@ -356,7 +356,6 @@ dependencies = [
  "solana-runtime",
  "tempfile",
  "tikv-jemallocator",
- "tokio",
 ]
 
 [[package]]

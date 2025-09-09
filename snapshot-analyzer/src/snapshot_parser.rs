@@ -1,13 +1,13 @@
 use {
     log::*,
+    rayon::prelude::*,
     solana_accounts_db::accounts_file::StorageAccess,
     solana_pubkey::Pubkey,
     solana_runtime::{
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
         snapshot_utils::verify_and_unarchive_snapshots,
     },
-    std::{collections::HashMap, path::PathBuf, sync::Arc},
-    tokio::sync::Mutex,
+    std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex}},
 };
 
 
@@ -24,7 +24,7 @@ impl SnapshotParser {
         }
     }
 
-    pub async fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<HashMap<Pubkey, u64>, Box<dyn std::error::Error>> {
+    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<HashMap<Pubkey, u64>, Box<dyn std::error::Error>> {
         info!("Parsing snapshot directly: {}", self.snapshot_path.display());
         
         // Parse the snapshot archive info
@@ -53,7 +53,7 @@ impl SnapshotParser {
             StorageAccess::File,
         )?;
 
-        info!("Snapshot unpacked, scanning for tracked accounts with async I/O...");
+        info!("Snapshot unpacked, scanning for tracked accounts with rayon...");
 
         // Use Arc<Mutex<HashMap>> for thread-safe access
         let tracked_accounts = Arc::new(Mutex::new(HashMap::new()));
@@ -64,20 +64,16 @@ impl SnapshotParser {
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
-        info!("Processing {} storage entries with limited concurrency for I/O efficiency", storage_entries.len());
+        info!("Processing {} storage entries with 16 parallel threads", storage_entries.len());
 
-        // Use a semaphore to limit concurrent I/O operations (4-6 threads for I/O bound work)
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
-        let mut tasks = Vec::new();
+        // Configure rayon to use 16 threads
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()?;
 
-        for (slot, storage_entry) in storage_entries {
-            let tracked_accounts = tracked_accounts.clone();
-            let activity_map = activity_map.clone();
-            let semaphore = semaphore.clone();
-            
-            let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                
+        // Use rayon to process storage entries in parallel
+        thread_pool.install(|| {
+            storage_entries.par_iter().for_each(|(slot, storage_entry)| {
                 let mut local_accounts = HashMap::new();
                 
                 // Scan this storage entry (this is the I/O heavy part)
@@ -94,23 +90,17 @@ impl SnapshotParser {
                     warn!("Failed to scan storage for slot {}: {}", slot, e);
                 } else if !local_accounts.is_empty() {
                     // Batch insert into shared map
-                    let mut shared_accounts = tracked_accounts.lock().await;
+                    let mut shared_accounts = tracked_accounts.lock().unwrap();
                     shared_accounts.extend(local_accounts);
                 }
             });
-            
-            tasks.push(task);
-        }
-
-        // Wait for all scanning tasks to complete
-        for task in tasks {
-            let _ = task.await;
-        }
+        });
 
         // Extract the final results
         let tracked_accounts = Arc::try_unwrap(tracked_accounts)
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .unwrap();
 
         // Store temp_dir to keep it alive
         self.temp_dir = Some(temp_dir);

@@ -96,7 +96,7 @@ pub struct AccountActivity {
 }
 
 
-async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result<()> {
+fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result<()> {
     info!("Creating database at: {}", output.display());
     
     // Remove existing database
@@ -139,7 +139,7 @@ async fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> 
     
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let account_sizes = parser.parse_accounts(&activity_map).await
+    let account_sizes = parser.parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
     
     info!("Inserting data into database...");
@@ -363,15 +363,14 @@ fn run_block_usage_query(database: PathBuf, _slot_accounts_file: PathBuf) -> Res
     run_query(database, query.to_string())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     solana_logger::setup();
 
     let cli = Cli::parse();
 
     match cli.command {
         Commands::CreateDb { snapshot, index, output } => {
-            create_database(snapshot, index, output).await
+            create_database(snapshot, index, output)
         },
         Commands::Query { database, query } => {
             run_query(database, query)
