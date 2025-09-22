@@ -54,26 +54,19 @@ enum Commands {
         query: String,
     },
     
-    /// Analyze account staleness (runs predefined query)
-    Staleness {
+    /// Run SQL template with parameters
+    RunQuery {
         /// Path to the database file
         #[arg(long, short = 'd')]
         database: PathBuf,
         
-        /// Current epoch for staleness calculation
-        #[arg(long)]
-        current_epoch: Option<u16>,
-    },
-    
-    /// Analyze block usage (requires additional slot-account mapping)
-    BlockUsage {
-        /// Path to the database file
-        #[arg(long, short = 'd')]
-        database: PathBuf,
+        /// SQL template file name (from templates/ directory, without .sql extension)
+        #[arg(long, short = 't')]
+        template: String,
         
-        /// Path to bincode file containing HashMap<u64, Vec<String>> mapping slots to account lists
-        #[arg(long, short = 'f')]
-        slot_accounts_file: PathBuf,
+        /// Template parameters in format key=value (can be specified multiple times)
+        #[arg(long, short = 'p')]
+        params: Vec<String>,
     },
 }
 
@@ -93,6 +86,14 @@ pub struct AccountActivity {
     pub read_count: u32,
     /// Total number of write operations
     pub write_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountMetadata {
+    pub lamports: u64,
+    pub owner: Pubkey,
+    pub executable: bool,
+    pub data_size: u64,
 }
 
 
@@ -120,6 +121,9 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
         CREATE TABLE accounts (
             account TEXT PRIMARY KEY,
             account_size INTEGER,
+            lamports INTEGER,
+            owner TEXT,
+            executable INTEGER,
             top_read_epochs TEXT,
             top_write_epochs TEXT,
             read_count INTEGER,
@@ -139,7 +143,7 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
     
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let account_sizes = parser.parse_accounts(&activity_map)
+    let account_metadata = parser.parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
     
     info!("Inserting data into database...");
@@ -149,13 +153,13 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
     
     // Prepare statement once
     let mut stmt = tx.prepare(r#"
-        INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     "#)?;
     
     let mut inserted = 0;
     
     for (pubkey, activity) in &activity_map {
-        if let Some(&account_size) = account_sizes.get(pubkey) {
+        if let Some(metadata) = account_metadata.get(pubkey) {
             let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
             let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
             let total_activity = activity.read_count + activity.write_count;
@@ -168,7 +172,10 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
             
             stmt.execute((
                 &pubkey.to_string(),
-                account_size as i64,
+                metadata.data_size as i64,
+                metadata.lamports as i64,
+                &metadata.owner.to_string(),
+                metadata.executable as i32,
                 &read_epochs_str,
                 &write_epochs_str,
                 activity.read_count as i32,
@@ -255,112 +262,87 @@ fn run_query(database: PathBuf, query: String) -> Result<()> {
     Ok(())
 }
 
-fn run_staleness_query(database: PathBuf, current_epoch: Option<u16>) -> Result<()> {
-    let conn = Connection::open(&database)?;
-    
-    let current_epoch = match current_epoch {
-        Some(epoch) => epoch,
-        None => {
-            // Get the highest epoch from the database
-            let mut stmt = conn.prepare("SELECT MAX(MAX(max_read_epoch, max_write_epoch)) FROM accounts")?;
-            let max_epoch: Option<i32> = stmt.query_row([], |row| row.get(0))?;
-            match max_epoch {
-                Some(epoch) => {
-                    info!("Using highest epoch from database: {}", epoch);
-                    epoch as u16
-                },
-                None => {
-                    warn!("No epochs found in database, using default: 600");
-                    600
-                }
-            }
-        }
-    };
-    
-    let query = format!(r#"
-        WITH staleness_buckets AS (
-            SELECT 
-                account,
-                account_size,
-                MAX(max_read_epoch, max_write_epoch) as latest_epoch,
-                CASE 
-                    WHEN MAX(max_read_epoch, max_write_epoch) >= {} - 20 THEN '1_month'
-                    WHEN MAX(max_read_epoch, max_write_epoch) >= {} - 40 THEN '2_months'
-                    WHEN MAX(max_read_epoch, max_write_epoch) >= {} - 80 THEN '4_months'
-                    WHEN MAX(max_read_epoch, max_write_epoch) >= {} - 160 THEN '8_months'
-                    ELSE 'older'
-                END as staleness_category
-            FROM accounts
-        )
-        SELECT 
-            staleness_category,
-            COUNT(*) as account_count,
-            SUM(account_size) as total_bytes,
-            ROUND(CAST(SUM(account_size) AS REAL) / 1000000000.0, 2) as total_gb
-        FROM staleness_buckets 
-        GROUP BY staleness_category 
-        ORDER BY 
-            CASE staleness_category 
-                WHEN '1_month' THEN 1
-                WHEN '2_months' THEN 2  
-                WHEN '4_months' THEN 3
-                WHEN '8_months' THEN 4
-                ELSE 5
-            END;
-    "#, current_epoch, current_epoch, current_epoch, current_epoch);
-    
-    println!("Account Staleness Analysis (Current Epoch: {})", current_epoch);
-    println!("Category\tAccounts\tTotal Bytes\tTotal GB");
-    
-    // Run the query using the existing connection
-    let mut stmt = conn.prepare(&query)?;
-    let column_count = stmt.column_count();
-    
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
-        for i in 0..column_count {
-            let value: String = match row.get::<_, Option<String>>(i) {
-                Ok(Some(s)) => s,
-                Ok(None) => "NULL".to_string(),
-                Err(_) => {
-                    // Try as integer
-                    match row.get::<_, Option<i64>>(i) {
-                        Ok(Some(n)) => n.to_string(),
-                        Ok(None) => "NULL".to_string(),
-                        Err(_) => "NULL".to_string(),
-                    }
-                }
-            };
-            values.push(value);
-        }
-        Ok(values)
-    })?;
-    
-    for row in rows {
-        let row = row?;
-        println!("{}", row.join("\t"));
-    }
 
-    Ok(())
+fn parse_template_params(params: Vec<String>) -> Result<HashMap<String, String>> {
+    let mut param_map = HashMap::new();
+    
+    for param in params {
+        let parts: Vec<&str> = param.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid parameter format: '{}'. Expected 'key=value'", param));
+        }
+        param_map.insert(parts[0].to_string(), parts[1].to_string());
+    }
+    
+    Ok(param_map)
 }
 
-fn run_block_usage_query(database: PathBuf, _slot_accounts_file: PathBuf) -> Result<()> {
-    // For now, just show the most active accounts since block usage needs the slot mapping
-    let query = r#"
-        SELECT 
-            account,
-            account_size,
-            total_activity_count,
-            max_read_epoch,
-            max_write_epoch
-        FROM accounts 
-        ORDER BY total_activity_count DESC 
-        LIMIT 20;
-    "#;
+fn substitute_template_params(template: &str, params: &HashMap<String, String>) -> String {
+    let mut result = template.to_string();
     
-    println!("Most Active Accounts:");
-    println!("Account\tSize\tActivity\tMax Read\tMax Write");
-    run_query(database, query.to_string())
+    for (key, value) in params {
+        let placeholder = format!("{{{{{}}}}}", key);
+        result = result.replace(&placeholder, value);
+    }
+    
+    result
+}
+
+fn load_template(template_name: &str) -> Result<String> {
+    let template_path = PathBuf::from("snapshot-analyzer/templates")
+        .join(format!("{}.sql", template_name));
+    
+    match std::fs::read_to_string(&template_path) {
+        Ok(content) => Ok(content),
+        Err(_) => {
+            // Try from current directory if relative path doesn't work
+            let template_path = PathBuf::from("templates")
+                .join(format!("{}.sql", template_name));
+            std::fs::read_to_string(&template_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load template '{}': {}", template_name, e))
+        }
+    }
+}
+
+fn run_template_query(database: PathBuf, template: String, params: Vec<String>) -> Result<()> {
+    info!("Loading template: {}", template);
+    let template_content = load_template(&template)?;
+    
+    info!("Parsing template parameters");
+    let param_map = parse_template_params(params)?;
+    
+    info!("Substituting template parameters");
+    let final_query = substitute_template_params(&template_content, &param_map);
+    
+    // Check for unresolved placeholders
+    if final_query.contains("{{") && final_query.contains("}}") {
+        let mut missing_params = Vec::new();
+        let mut start = 0;
+        while let Some(open) = final_query[start..].find("{{") {
+            let open_pos = start + open + 2;
+            if let Some(close) = final_query[open_pos..].find("}}") {
+                let param_name = &final_query[open_pos..open_pos + close];
+                missing_params.push(param_name.to_string());
+                start = open_pos + close + 2;
+            } else {
+                break;
+            }
+        }
+        
+        if !missing_params.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Template has unresolved parameters: {}. Please provide values using -p key=value",
+                missing_params.join(", ")
+            ));
+        }
+    }
+    
+    info!("Executing query");
+    println!("Template: {}", template);
+    println!("Parameters: {:?}", param_map);
+    println!();
+    
+    run_query(database, final_query)
 }
 
 fn main() -> Result<()> {
@@ -375,11 +357,8 @@ fn main() -> Result<()> {
         Commands::Query { database, query } => {
             run_query(database, query)
         },
-        Commands::Staleness { database, current_epoch } => {
-            run_staleness_query(database, current_epoch)
-        },
-        Commands::BlockUsage { database, slot_accounts_file } => {
-            run_block_usage_query(database, slot_accounts_file)
+        Commands::RunQuery { database, template, params } => {
+            run_template_query(database, template, params)
         },
     }
 }

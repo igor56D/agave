@@ -24,7 +24,7 @@ impl SnapshotParser {
         }
     }
 
-    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<HashMap<Pubkey, u64>, Box<dyn std::error::Error>> {
+    pub fn parse_accounts(&mut self, activity_map: &HashMap<Pubkey, crate::AccountActivity>) -> Result<HashMap<Pubkey, crate::AccountMetadata>, Box<dyn std::error::Error>> {
         info!("Parsing snapshot directly: {}", self.snapshot_path.display());
         
         // Parse the snapshot archive info
@@ -81,8 +81,13 @@ impl SnapshotParser {
                     let pubkey = *account.pubkey;
                     
                     if activity_map.contains_key(&pubkey) {
-                        let data_len = account.data.len() as u64;
-                        local_accounts.insert(pubkey, data_len);
+                        let metadata = crate::AccountMetadata {
+                            lamports: account.lamports,
+                            owner: *account.owner,
+                            executable: account.executable,
+                            data_size: account.data.len() as u64,
+                        };
+                        local_accounts.insert(pubkey, metadata);
                     }
                 });
                 
