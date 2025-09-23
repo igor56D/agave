@@ -325,12 +325,42 @@ fn load_template(template_name: &str) -> Result<String> {
     }
 }
 
+fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, String>) {
+    // Define defaults for each template
+    match template_name {
+        "staleness" => {
+            param_map.entry("current_epoch".to_string()).or_insert("600".to_string());
+            param_map.entry("lookback_epochs".to_string()).or_insert("50".to_string());
+        },
+        "most_active" => {
+            param_map.entry("limit".to_string()).or_insert("20".to_string());
+        },
+        "owner_analysis" => {
+            param_map.entry("min_accounts".to_string()).or_insert("1".to_string());
+        },
+        "balance_range" => {
+            param_map.entry("min_lamports".to_string()).or_insert("0".to_string());
+            param_map.entry("max_lamports".to_string()).or_insert("NULL".to_string());
+        },
+        "read_write_ratio" => {
+            param_map.entry("limit".to_string()).or_insert("20".to_string());
+            param_map.entry("min_activity".to_string()).or_insert("10".to_string());
+        },
+        _ => {
+            // No defaults for unknown templates
+        }
+    }
+}
+
 fn run_template_query(database: PathBuf, template: String, params: Vec<String>) -> Result<()> {
     info!("Loading template: {}", template);
     let template_content = load_template(&template)?;
     
     info!("Parsing template parameters");
-    let param_map = parse_template_params(params)?;
+    let mut param_map = parse_template_params(params)?;
+    
+    info!("Applying default parameters");
+    apply_default_params(&template, &mut param_map);
     
     info!("Substituting template parameters");
     let final_query = substitute_template_params(&template_content, &param_map);
