@@ -237,17 +237,12 @@ fn run_query(database: PathBuf, query: String) -> Result<()> {
     let rows = stmt.query_map([], |row| {
         let mut values = Vec::new();
         for i in 0..column_count {
-            let value: String = match row.get::<_, Option<String>>(i) {
-                Ok(Some(s)) => s,
-                Ok(None) => "NULL".to_string(),
-                Err(_) => {
-                    // Try as integer
-                    match row.get::<_, Option<i64>>(i) {
-                        Ok(Some(n)) => n.to_string(),
-                        Ok(None) => "NULL".to_string(),
-                        Err(_) => "NULL".to_string(),
-                    }
-                }
+            let value: String = match row.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                rusqlite::types::ValueRef::Real(f) => format!("{}", f),
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                rusqlite::types::ValueRef::Blob(_) => "<BLOB>".to_string(),
             };
             values.push(value);
         }
