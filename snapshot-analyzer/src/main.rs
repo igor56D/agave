@@ -9,6 +9,7 @@ use {
     snapshot_parser::SnapshotParser,
     solana_pubkey::Pubkey,
     std::{collections::HashMap, path::{Path, PathBuf}},
+    tabled::{builder::Builder, settings::Style},
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
@@ -234,7 +235,13 @@ fn run_query(database: PathBuf, query: String) -> Result<()> {
     let mut stmt = conn.prepare(&query)?;
     let column_count = stmt.column_count();
     
-    let rows = stmt.query_map([], |row| {
+    // Get column names
+    let column_names: Vec<String> = (0..column_count)
+        .map(|i| stmt.column_name(i).unwrap_or("Unknown").to_string())
+        .collect();
+    
+    // Collect all rows
+    let rows: Result<Vec<Vec<String>>, _> = stmt.query_map([], |row| {
         let mut values = Vec::new();
         for i in 0..column_count {
             let value: String = match row.get_ref(i)? {
@@ -247,12 +254,31 @@ fn run_query(database: PathBuf, query: String) -> Result<()> {
             values.push(value);
         }
         Ok(values)
-    })?;
+    })?.collect();
     
-    for row in rows {
-        let row = row?;
-        println!("{}", row.join("\t"));
+    let rows = rows?;
+    
+    if rows.is_empty() {
+        println!("No results found.");
+        return Ok(());
     }
+    
+    // Create table with builder
+    let mut builder = Builder::default();
+    
+    // Add header row
+    builder.push_record(column_names);
+    
+    // Add data rows
+    for row in rows {
+        builder.push_record(row);
+    }
+    
+    // Build and style the table
+    let mut table = builder.build();
+    table.with(Style::modern());
+    
+    println!("{}", table);
 
     Ok(())
 }

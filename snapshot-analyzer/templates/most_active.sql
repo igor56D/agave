@@ -15,5 +15,5 @@ SELECT
     max_read_epoch,
     max_write_epoch
 FROM accounts 
-ORDER BY total_activity_count DESC 
+ORDER BY total_ctivity_count DESC 
 LIMIT {{limit}};

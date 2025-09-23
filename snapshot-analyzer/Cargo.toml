@@ -35,6 +35,7 @@ rayon = { workspace = true }
 reqwest = { workspace = true }
 csv = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
+tabled = "0.15"
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true } 
