@@ -7,7 +7,6 @@ SELECT
     owner,
     COUNT(*) as account_count,
     SUM(account_size) as total_bytes,
-    ROUND(SUM(account_size) * 1.0 / 1000000.0, 2) as total_mb,
     ROUND(SUM(account_size) * 1.0 / 1000000000.0, 4) as total_gb,
     SUM(lamports) as total_lamports,
     ROUND(SUM(lamports) * 1.0 / 1000000000.0, 2) as total_sol,
@@ -18,4 +17,4 @@ SELECT
 FROM accounts 
 GROUP BY owner
 HAVING COUNT(*) >= {{min_accounts}}
-ORDER BY total_lamports DESC;
+ORDER BY total_bytes DESC;
