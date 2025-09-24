@@ -550,6 +550,22 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
                 .entry("min_activity".to_string())
                 .or_insert("10".to_string());
         }
+        "index_only_staleness" => {
+            param_map
+                .entry("current_epoch".to_string())
+                .or_insert("600".to_string());
+            param_map
+                .entry("lookback_epochs".to_string())
+                .or_insert("50".to_string());
+        }
+        "index_only_staleness_breakdown" => {
+            param_map
+                .entry("current_epoch".to_string())
+                .or_insert("600".to_string());
+            param_map
+                .entry("lookback_epochs".to_string())
+                .or_insert("50".to_string());
+        }
         _ => {
             // No defaults for unknown templates
         }

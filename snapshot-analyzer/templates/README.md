@@ -49,6 +49,30 @@ None required.
 agave-snapshot-analyzer run-query -d database.db -t size_distribution
 ```
 
+### index_only_staleness.sql
+Analyzes staleness for accounts that exist in the activity index but not in the snapshot (index-only accounts). These are accounts that had activity but are no longer present in the current snapshot.
+
+**Parameters:**
+- `current_epoch` (default: 600): Current epoch number
+- `lookback_epochs` (default: 50): Number of epochs to look back for activity
+
+**Example usage:**
+```bash
+agave-snapshot-analyzer run-query -d index_only.db -t index_only_staleness -p current_epoch=600 -p lookback_epochs=50
+```
+
+### index_only_staleness_breakdown.sql
+Detailed breakdown of staleness for index-only accounts by activity level and staleness category. Provides a comprehensive view of how accounts are distributed across activity levels and staleness periods.
+
+**Parameters:**
+- `current_epoch` (default: 600): Current epoch number
+- `lookback_epochs` (default: 50): Number of epochs to look back for activity
+
+**Example usage:**
+```bash
+agave-snapshot-analyzer run-query -d index_only.db -t index_only_staleness_breakdown -p current_epoch=600 -p lookback_epochs=50
+```
+
 ## Template Format
 
 Templates use `{{parameter_name}}` syntax for parameter substitution. Parameters are provided via `-p key=value` command line arguments.
