@@ -350,6 +350,7 @@ dependencies = [
  "serde_json",
  "solana-account",
  "solana-accounts-db",
+ "solana-bloom",
  "solana-clock",
  "solana-logger",
  "solana-pubkey",

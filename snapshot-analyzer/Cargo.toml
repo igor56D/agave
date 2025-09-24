@@ -27,6 +27,7 @@ solana-clock = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-runtime = { workspace = true }
 solana-accounts-db = { workspace = true }
+solana-bloom = { workspace = true }
 solana-logger = "=2.3.1"
 anyhow = { workspace = true }
 tempfile = { workspace = true }

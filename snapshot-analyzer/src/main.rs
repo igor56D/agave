@@ -7,6 +7,7 @@ use {
     rusqlite::Connection,
     serde::{Deserialize, Serialize},
     snapshot_parser::SnapshotParser,
+    solana_bloom::bloom::Bloom,
     solana_pubkey::Pubkey,
     std::{collections::HashMap, path::{Path, PathBuf}},
     tabled::{builder::Builder, settings::Style},
@@ -72,6 +73,21 @@ enum Commands {
         /// Template parameters in format key=value (can be specified multiple times)
         #[arg(long, short = 'p')]
         params: Vec<String>,
+    },
+    
+    /// Create bloom filter from all pubkeys in snapshot
+    CreateBloom {
+        /// Path to the snapshot archive file
+        #[arg(long, short = 's')]
+        snapshot: PathBuf,
+        
+        /// Output bloom filter file path
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        
+        /// False positive rate (default: 0.01 = 1%)
+        #[arg(long, default_value = "0.01")]
+        false_rate: f64,
     },
 }
 
@@ -498,6 +514,79 @@ fn run_template_query(database: PathBuf, template: String, params: Vec<String>) 
     run_query(database, final_query)
 }
 
+fn create_bloom_filter(snapshot: PathBuf, output: PathBuf, false_rate: f64) -> Result<()> {
+    info!("Creating bloom filter from snapshot: {}", snapshot.display());
+    info!("Output file: {}", output.display());
+    info!("False positive rate: {}", false_rate);
+    
+    // Parse snapshot to get all pubkeys
+    info!("Parsing snapshot for all pubkeys...");
+    let mut parser = SnapshotParser::new(&snapshot);
+    let all_pubkeys = parser.parse_all_pubkeys()
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
+    
+    let num_pubkeys = all_pubkeys.len();
+    info!("Found {} pubkeys in snapshot", num_pubkeys);
+    
+    if num_pubkeys == 0 {
+        return Err(anyhow::anyhow!("No pubkeys found in snapshot"));
+    }
+    
+    // Calculate optimal bloom filter size with 1GB limit
+    const MAX_BITS: usize = 1024 * 1024 * 1024 * 8; // 1GB in bits
+    info!("Creating bloom filter with max {} bits (1GB)", MAX_BITS);
+    
+    // Create bloom filter with optimal parameters
+    let mut bloom: Bloom<Pubkey> = Bloom::random(num_pubkeys, false_rate, MAX_BITS);
+    
+    info!("Bloom filter created with {} bits and {} hash functions", 
+          bloom.bits.len(), bloom.keys.len());
+    
+    // Calculate actual memory usage
+    let memory_usage_bits = bloom.bits.len();
+    let memory_usage_bytes = memory_usage_bits / 8;
+    let memory_usage_mb = memory_usage_bytes as f64 / (1024.0 * 1024.0);
+    info!("Bloom filter memory usage: {:.2} MB", memory_usage_mb);
+    
+    // Add all pubkeys to the bloom filter
+    info!("Adding {} pubkeys to bloom filter...", num_pubkeys);
+    let mut added = 0;
+    for pubkey in &all_pubkeys {
+        bloom.add(pubkey);
+        added += 1;
+        
+        // Progress reporting every 100k pubkeys
+        if added % 100000 == 0 {
+            info!("Added {} pubkeys...", added);
+        }
+    }
+    
+    info!("Successfully added all {} pubkeys to bloom filter", added);
+    
+    // Serialize and write bloom filter to disk
+    info!("Serializing bloom filter...");
+    let serialized_bloom = bincode::serialize(&bloom)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize bloom filter: {}", e))?;
+    
+    let serialized_size_mb = serialized_bloom.len() as f64 / (1024.0 * 1024.0);
+    info!("Serialized bloom filter size: {:.2} MB", serialized_size_mb);
+    
+    info!("Writing bloom filter to disk...");
+    std::fs::write(&output, &serialized_bloom)
+        .map_err(|e| anyhow::anyhow!("Failed to write bloom filter to {}: {}", output.display(), e))?;
+    
+    info!("Bloom filter successfully written to: {}", output.display());
+    println!("Bloom filter created successfully!");
+    println!("  - Input pubkeys: {}", num_pubkeys);
+    println!("  - False positive rate: {}", false_rate);
+    println!("  - Memory usage: {:.2} MB", memory_usage_mb);
+    println!("  - Serialized size: {:.2} MB", serialized_size_mb);
+    println!("  - Hash functions: {}", bloom.keys.len());
+    println!("  - Output file: {}", output.display());
+    
+    Ok(())
+}
+
 fn main() -> Result<()> {
     solana_logger::setup();
 
@@ -512,6 +601,9 @@ fn main() -> Result<()> {
         },
         Commands::RunQuery { database, template, params } => {
             run_template_query(database, template, params)
+        },
+        Commands::CreateBloom { snapshot, output, false_rate } => {
+            create_bloom_filter(snapshot, output, false_rate)
         },
     }
 }
