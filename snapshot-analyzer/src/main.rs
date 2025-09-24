@@ -191,10 +191,17 @@ fn create_index_only_database(
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
     info!("Identifying accounts in index but NOT in snapshot...");
-    let index_only_accounts: HashMap<Pubkey, AccountActivity> = activity_map
-        .into_par_iter()
-        .filter(|(pubkey, _)| !accounts_in_snapshot.contains_key(pubkey))
-        .collect();
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(32)
+        .build()
+        .expect("Failed to create thread pool");
+
+    let index_only_accounts: HashMap<Pubkey, AccountActivity> = thread_pool.install(|| {
+        activity_map
+            .into_par_iter()
+            .filter(|(pubkey, _)| !accounts_in_snapshot.contains_key(pubkey))
+            .collect()
+    });
 
     info!(
         "Found {} accounts in index but not in snapshot",

@@ -73,7 +73,7 @@ impl SnapshotParser {
             .collect();
 
         info!(
-            "Processing {} storage entries with 16 parallel threads",
+            "Processing {} storage entries with 32 parallel threads",
             storage_entries.len()
         );
 
@@ -93,9 +93,9 @@ impl SnapshotParser {
     {
         let shared_data = Arc::new(Mutex::new(initial_value));
 
-        // Configure rayon to use 16 threads
+        // Configure rayon to use 32 threads
         let thread_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(16)
+            .num_threads(32)
             .build()
             .expect("Failed to create thread pool");
 
