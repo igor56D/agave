@@ -4,19 +4,22 @@ use {
     anyhow::Result,
     clap::{Parser, Subcommand},
     log::*,
+    rayon::prelude::*,
     rusqlite::Connection,
     serde::{Deserialize, Serialize},
     snapshot_parser::SnapshotParser,
     solana_bloom::bloom::Bloom,
     solana_pubkey::Pubkey,
-    std::{collections::HashMap, path::{Path, PathBuf}},
+    std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+    },
     tabled::{builder::Builder, settings::Style},
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
 
 #[derive(Parser)]
 #[command(
@@ -35,56 +38,56 @@ enum Commands {
         /// Path to the snapshot archive file
         #[arg(long, short = 's')]
         snapshot: PathBuf,
-        
+
         /// Path to the bincode account activity index file
         #[arg(long, short = 'i')]
         index: PathBuf,
-        
+
         /// Output database file path
         #[arg(long, short = 'o')]
         output: PathBuf,
-        
+
         /// Create database of accounts in index but not in snapshot (index-only accounts)
         #[arg(long)]
         index_only: bool,
     },
-    
+
     /// Run SQL query on database
     Query {
         /// Path to the database file
         #[arg(long, short = 'd')]
         database: PathBuf,
-        
+
         /// SQL query to execute
         #[arg(long, short = 'q')]
         query: String,
     },
-    
+
     /// Run SQL template with parameters
     RunQuery {
         /// Path to the database file
         #[arg(long, short = 'd')]
         database: PathBuf,
-        
+
         /// SQL template file name (from templates/ directory, without .sql extension)
         #[arg(long, short = 't')]
         template: String,
-        
+
         /// Template parameters in format key=value (can be specified multiple times)
         #[arg(long, short = 'p')]
         params: Vec<String>,
     },
-    
+
     /// Create bloom filter from all pubkeys in snapshot
     CreateBloom {
         /// Path to the snapshot archive file
         #[arg(long, short = 's')]
         snapshot: PathBuf,
-        
+
         /// Output bloom filter file path
         #[arg(long, short = 'o')]
         output: PathBuf,
-        
+
         /// False positive rate (default: 0.01 = 1%)
         #[arg(long, default_value = "0.01")]
         false_rate: f64,
@@ -101,7 +104,7 @@ pub struct AccountActivityEntry {
 pub struct AccountActivity {
     /// Top 10 highest epochs where this account was read from (sorted descending)
     pub top_read_epochs: Vec<u16>,
-    /// Top 10 highest epochs where this account was written to (sorted descending) 
+    /// Top 10 highest epochs where this account was written to (sorted descending)
     pub top_write_epochs: Vec<u16>,
     /// Total number of read operations
     pub read_count: u32,
@@ -117,26 +120,32 @@ pub struct AccountMetadata {
     pub data_size: u64,
 }
 
-
-fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf, index_only: bool) -> Result<()> {
+fn create_database(
+    snapshot: PathBuf,
+    index: PathBuf,
+    output: PathBuf,
+    index_only: bool,
+) -> Result<()> {
     info!("Creating database at: {}", output.display());
-    
+
     // Remove existing database
     if output.exists() {
         std::fs::remove_file(&output)?;
     }
-    
+
     // Create SQLite connection
     let conn = Connection::open(&output)?;
-    
+
     // Optimize SQLite for bulk inserts
-    conn.execute_batch(r#"
+    conn.execute_batch(
+        r#"
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA cache_size = 100000;
         PRAGMA temp_store = MEMORY;
-    "#)?;
-    
+    "#,
+    )?;
+
     if index_only {
         return create_index_only_database(conn, snapshot, index);
     } else {
@@ -144,11 +153,16 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf, index_onl
     }
 }
 
-fn create_index_only_database(mut conn: Connection, snapshot: PathBuf, index: PathBuf) -> Result<()> {
+fn create_index_only_database(
+    mut conn: Connection,
+    snapshot: PathBuf,
+    index: PathBuf,
+) -> Result<()> {
     info!("Creating index-only database (accounts in index but not in snapshot)");
-    
+
     // Create the index-only accounts table (no snapshot metadata)
-    conn.execute_batch(r#"
+    conn.execute_batch(
+        r#"
         CREATE TABLE index_only_accounts (
             account TEXT PRIMARY KEY,
             top_read_epochs TEXT,
@@ -159,51 +173,69 @@ fn create_index_only_database(mut conn: Connection, snapshot: PathBuf, index: Pa
             max_write_epoch INTEGER,
             total_activity_count INTEGER
         );
-    "#)?;
-    
+    "#,
+    )?;
+
     // Load account activity index
     info!("Loading account activity index...");
     let activity_map = load_account_activity_index(&index);
     if activity_map.is_empty() {
         return Err(anyhow::anyhow!("No activity entries loaded"));
     }
-    
+
     // Load snapshot to identify which accounts ARE in it
     info!("Loading snapshot to identify accounts present in snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let accounts_in_snapshot = parser.parse_accounts(&activity_map)
+    let accounts_in_snapshot = parser
+        .parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
-    
+
     info!("Identifying accounts in index but NOT in snapshot...");
-    let mut index_only_accounts = HashMap::new();
-    for (pubkey, activity) in &activity_map {
-        // If the account is NOT in the snapshot, it's index-only
-        if !accounts_in_snapshot.contains_key(pubkey) {
-            index_only_accounts.insert(pubkey.clone(), activity.clone());
-        }
-    }
-    
-    info!("Found {} accounts in index but not in snapshot", index_only_accounts.len());
+    let index_only_accounts: HashMap<Pubkey, AccountActivity> = activity_map
+        .into_par_iter()
+        .filter(|(pubkey, _)| !accounts_in_snapshot.contains_key(pubkey))
+        .collect();
+
+    info!(
+        "Found {} accounts in index but not in snapshot",
+        index_only_accounts.len()
+    );
     info!("Inserting index-only accounts into database...");
-    
+
     let tx = conn.transaction()?;
-    let mut stmt = tx.prepare(r#"
+    let mut stmt = tx.prepare(
+        r#"
         INSERT INTO index_only_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    "#)?;
-    
+    "#,
+    )?;
+
     let mut inserted = 0;
-    
+
     for (pubkey, activity) in &index_only_accounts {
         let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
         let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
         let total_activity = activity.read_count + activity.write_count;
-        
+
         // Convert arrays to JSON strings
-        let read_epochs_str = format!("[{}]", activity.top_read_epochs.iter()
-            .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-        let write_epochs_str = format!("[{}]", activity.top_write_epochs.iter()
-            .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-        
+        let read_epochs_str = format!(
+            "[{}]",
+            activity
+                .top_read_epochs
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let write_epochs_str = format!(
+            "[{}]",
+            activity
+                .top_write_epochs
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
         stmt.execute((
             &pubkey.to_string(),
             &read_epochs_str,
@@ -214,29 +246,33 @@ fn create_index_only_database(mut conn: Connection, snapshot: PathBuf, index: Pa
             max_write,
             total_activity as i32,
         ))?;
-        
+
         inserted += 1;
-        
+
         // Progress reporting every 50k accounts
         if inserted % 50000 == 0 {
             info!("Inserted {} index-only accounts...", inserted);
         }
     }
-    
+
     // Commit the transaction
     drop(stmt);
     tx.commit()?;
-    
-    info!("Index-only database created successfully with {} accounts", inserted);
+
+    info!(
+        "Index-only database created successfully with {} accounts",
+        inserted
+    );
     println!("Index-only accounts added: {}", inserted);
     Ok(())
 }
 
 fn create_standard_database(mut conn: Connection, snapshot: PathBuf, index: PathBuf) -> Result<()> {
     info!("Creating standard database (accounts in both index and snapshot)");
-    
+
     // Create the main accounts table
-    conn.execute_batch(r#"
+    conn.execute_batch(
+        r#"
         CREATE TABLE accounts (
             account TEXT PRIMARY KEY,
             account_size INTEGER,
@@ -251,44 +287,62 @@ fn create_standard_database(mut conn: Connection, snapshot: PathBuf, index: Path
             max_write_epoch INTEGER,
             total_activity_count INTEGER
         );
-    "#)?;
-    
+    "#,
+    )?;
+
     // Load and insert data
     info!("Loading account activity index...");
     let activity_map = load_account_activity_index(&index);
     if activity_map.is_empty() {
         return Err(anyhow::anyhow!("No activity entries loaded"));
     }
-    
+
     info!("Loading snapshot...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let account_metadata = parser.parse_accounts(&activity_map)
+    let account_metadata = parser
+        .parse_accounts(&activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
-    
+
     info!("Inserting data into database...");
-    
+
     // Use a single large transaction for maximum speed
     let tx = conn.transaction()?;
-    
+
     // Prepare statement once
-    let mut stmt = tx.prepare(r#"
+    let mut stmt = tx.prepare(
+        r#"
         INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    "#)?;
-    
+    "#,
+    )?;
+
     let mut inserted = 0;
-    
+
     for (pubkey, activity) in &activity_map {
         if let Some(metadata) = account_metadata.get(pubkey) {
             let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
             let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
             let total_activity = activity.read_count + activity.write_count;
-            
+
             // Convert arrays to JSON strings
-            let read_epochs_str = format!("[{}]", activity.top_read_epochs.iter()
-                .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-            let write_epochs_str = format!("[{}]", activity.top_write_epochs.iter()
-                .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-            
+            let read_epochs_str = format!(
+                "[{}]",
+                activity
+                    .top_read_epochs
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let write_epochs_str = format!(
+                "[{}]",
+                activity
+                    .top_write_epochs
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+
             stmt.execute((
                 &pubkey.to_string(),
                 metadata.data_size as i64,
@@ -303,35 +357,41 @@ fn create_standard_database(mut conn: Connection, snapshot: PathBuf, index: Path
                 max_write,
                 total_activity as i32,
             ))?;
-            
+
             inserted += 1;
-            
+
             // Progress reporting every 50k accounts
             if inserted % 50000 == 0 {
                 info!("Inserted {} accounts...", inserted);
             }
         }
     }
-    
+
     // Commit the entire transaction
     drop(stmt);
     tx.commit()?;
-    
-    info!("Database created successfully with {} tracked accounts", inserted);
+
+    info!(
+        "Database created successfully with {} tracked accounts",
+        inserted
+    );
     Ok(())
 }
 
 fn load_account_activity_index(index_path: &Path) -> HashMap<Pubkey, AccountActivity> {
-    info!("Loading account activity index from: {}", index_path.display());
-    
+    info!(
+        "Loading account activity index from: {}",
+        index_path.display()
+    );
+
     let file_data = match std::fs::read(index_path) {
         Ok(data) => data,
         Err(e) => {
-        warn!("Failed to read index file: {}. Using empty index.", e);
-        return HashMap::new();
+            warn!("Failed to read index file: {}. Using empty index.", e);
+            return HashMap::new();
         }
     };
-    
+
     match bincode::deserialize::<Vec<AccountActivityEntry>>(&file_data) {
         Ok(entries) => {
             info!("Loaded {} account activity entries", entries.len());
@@ -339,7 +399,7 @@ fn load_account_activity_index(index_path: &Path) -> HashMap<Pubkey, AccountActi
                 .into_iter()
                 .map(|entry| (entry.account, entry.activity))
                 .collect()
-        },
+        }
         Err(e) => {
             error!("Failed to deserialize account activity index: {}", e);
             HashMap::new()
@@ -349,94 +409,97 @@ fn load_account_activity_index(index_path: &Path) -> HashMap<Pubkey, AccountActi
 
 fn run_query(database: PathBuf, query: String) -> Result<()> {
     let conn = Connection::open(&database)?;
-    
+
     let mut stmt = conn.prepare(&query)?;
     let column_count = stmt.column_count();
-    
+
     // Get column names
     let column_names: Vec<String> = (0..column_count)
         .map(|i| stmt.column_name(i).unwrap_or("Unknown").to_string())
         .collect();
-    
+
     // Collect all rows
-    let rows: Result<Vec<Vec<String>>, _> = stmt.query_map([], |row| {
-        let mut values = Vec::new();
-        for i in 0..column_count {
-            let value: String = match row.get_ref(i)? {
-                rusqlite::types::ValueRef::Null => "NULL".to_string(),
-                rusqlite::types::ValueRef::Integer(n) => n.to_string(),
-                rusqlite::types::ValueRef::Real(f) => format!("{}", f),
-                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                rusqlite::types::ValueRef::Blob(_) => "<BLOB>".to_string(),
-            };
-            values.push(value);
-        }
-        Ok(values)
-    })?.collect();
-    
+    let rows: Result<Vec<Vec<String>>, _> = stmt
+        .query_map([], |row| {
+            let mut values = Vec::new();
+            for i in 0..column_count {
+                let value: String = match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                    rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => format!("{}", f),
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                    rusqlite::types::ValueRef::Blob(_) => "<BLOB>".to_string(),
+                };
+                values.push(value);
+            }
+            Ok(values)
+        })?
+        .collect();
+
     let rows = rows?;
-    
+
     if rows.is_empty() {
         println!("No results found.");
         return Ok(());
     }
-    
+
     // Create table with builder
     let mut builder = Builder::default();
-    
+
     // Add header row
     builder.push_record(column_names);
-    
+
     // Add data rows
     for row in rows {
         builder.push_record(row);
     }
-    
+
     // Build and style the table
     let mut table = builder.build();
     table.with(Style::modern());
-    
+
     println!("{}", table);
 
     Ok(())
 }
 
-
 fn parse_template_params(params: Vec<String>) -> Result<HashMap<String, String>> {
     let mut param_map = HashMap::new();
-    
+
     for param in params {
         let parts: Vec<&str> = param.splitn(2, '=').collect();
         if parts.len() != 2 {
-            return Err(anyhow::anyhow!("Invalid parameter format: '{}'. Expected 'key=value'", param));
+            return Err(anyhow::anyhow!(
+                "Invalid parameter format: '{}'. Expected 'key=value'",
+                param
+            ));
         }
         param_map.insert(parts[0].to_string(), parts[1].to_string());
     }
-    
+
     Ok(param_map)
 }
 
 fn substitute_template_params(template: &str, params: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
-    
+
     for (key, value) in params {
         let placeholder = format!("{{{{{}}}}}", key);
         result = result.replace(&placeholder, value);
     }
-    
+
     result
 }
 
 fn load_template(template_name: &str) -> Result<String> {
-    let template_path = PathBuf::from("snapshot-analyzer/templates")
-        .join(format!("{}.sql", template_name));
-    
+    let template_path =
+        PathBuf::from("snapshot-analyzer/templates").join(format!("{}.sql", template_name));
+
     match std::fs::read_to_string(&template_path) {
         Ok(content) => Ok(content),
         Err(_) => {
             // Try from current directory if relative path doesn't work
-            let template_path = PathBuf::from("templates")
-                .join(format!("{}.sql", template_name));
+            let template_path = PathBuf::from("templates").join(format!("{}.sql", template_name));
             std::fs::read_to_string(&template_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load template '{}': {}", template_name, e))
         }
@@ -447,23 +510,39 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
     // Define defaults for each template
     match template_name {
         "staleness" => {
-            param_map.entry("current_epoch".to_string()).or_insert("600".to_string());
-            param_map.entry("lookback_epochs".to_string()).or_insert("50".to_string());
-        },
+            param_map
+                .entry("current_epoch".to_string())
+                .or_insert("600".to_string());
+            param_map
+                .entry("lookback_epochs".to_string())
+                .or_insert("50".to_string());
+        }
         "most_active" => {
-            param_map.entry("limit".to_string()).or_insert("20".to_string());
-        },
+            param_map
+                .entry("limit".to_string())
+                .or_insert("20".to_string());
+        }
         "owner_analysis" => {
-            param_map.entry("min_accounts".to_string()).or_insert("1".to_string());
-        },
+            param_map
+                .entry("min_accounts".to_string())
+                .or_insert("1".to_string());
+        }
         "balance_range" => {
-            param_map.entry("min_lamports".to_string()).or_insert("0".to_string());
-            param_map.entry("max_lamports".to_string()).or_insert("NULL".to_string());
-        },
+            param_map
+                .entry("min_lamports".to_string())
+                .or_insert("0".to_string());
+            param_map
+                .entry("max_lamports".to_string())
+                .or_insert("NULL".to_string());
+        }
         "read_write_ratio" => {
-            param_map.entry("limit".to_string()).or_insert("20".to_string());
-            param_map.entry("min_activity".to_string()).or_insert("10".to_string());
-        },
+            param_map
+                .entry("limit".to_string())
+                .or_insert("20".to_string());
+            param_map
+                .entry("min_activity".to_string())
+                .or_insert("10".to_string());
+        }
         _ => {
             // No defaults for unknown templates
         }
@@ -473,16 +552,16 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
 fn run_template_query(database: PathBuf, template: String, params: Vec<String>) -> Result<()> {
     info!("Loading template: {}", template);
     let template_content = load_template(&template)?;
-    
+
     info!("Parsing template parameters");
     let mut param_map = parse_template_params(params)?;
-    
+
     info!("Applying default parameters");
     apply_default_params(&template, &mut param_map);
-    
+
     info!("Substituting template parameters");
     let final_query = substitute_template_params(&template_content, &param_map);
-    
+
     // Check for unresolved placeholders
     if final_query.contains("{{") && final_query.contains("}}") {
         let mut missing_params = Vec::new();
@@ -497,7 +576,7 @@ fn run_template_query(database: PathBuf, template: String, params: Vec<String>) 
                 break;
             }
         }
-        
+
         if !missing_params.is_empty() {
             return Err(anyhow::anyhow!(
                 "Template has unresolved parameters: {}. Please provide values using -p key=value",
@@ -505,76 +584,88 @@ fn run_template_query(database: PathBuf, template: String, params: Vec<String>) 
             ));
         }
     }
-    
+
     info!("Executing query");
     println!("Template: {}", template);
     println!("Parameters: {:?}", param_map);
     println!();
-    
+
     run_query(database, final_query)
 }
 
 fn create_bloom_filter(snapshot: PathBuf, output: PathBuf, false_rate: f64) -> Result<()> {
-    info!("Creating bloom filter from snapshot: {}", snapshot.display());
+    info!(
+        "Creating bloom filter from snapshot: {}",
+        snapshot.display()
+    );
     info!("Output file: {}", output.display());
     info!("False positive rate: {}", false_rate);
-    
+
     // Parse snapshot to get all pubkeys
     info!("Parsing snapshot for all pubkeys...");
     let mut parser = SnapshotParser::new(&snapshot);
-    let all_pubkeys = parser.parse_all_pubkeys()
+    let all_pubkeys = parser
+        .parse_all_pubkeys()
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
-    
+
     let num_pubkeys = all_pubkeys.len();
     info!("Found {} pubkeys in snapshot", num_pubkeys);
-    
+
     if num_pubkeys == 0 {
         return Err(anyhow::anyhow!("No pubkeys found in snapshot"));
     }
-    
+
     // Calculate optimal bloom filter size with 1GB limit
     const MAX_BITS: usize = 1024 * 1024 * 1024 * 8; // 1GB in bits
     info!("Creating bloom filter with max {} bits (1GB)", MAX_BITS);
-    
+
     // Create bloom filter with optimal parameters
     let mut bloom: Bloom<Pubkey> = Bloom::random(num_pubkeys, false_rate, MAX_BITS);
-    
-    info!("Bloom filter created with {} bits and {} hash functions", 
-          bloom.bits.len(), bloom.keys.len());
-    
+
+    info!(
+        "Bloom filter created with {} bits and {} hash functions",
+        bloom.bits.len(),
+        bloom.keys.len()
+    );
+
     // Calculate actual memory usage
     let memory_usage_bits = bloom.bits.len();
     let memory_usage_bytes = memory_usage_bits / 8;
     let memory_usage_mb = memory_usage_bytes as f64 / (1024.0 * 1024.0);
     info!("Bloom filter memory usage: {:.2} MB", memory_usage_mb);
-    
+
     // Add all pubkeys to the bloom filter
     info!("Adding {} pubkeys to bloom filter...", num_pubkeys);
     let mut added = 0;
     for pubkey in &all_pubkeys {
         bloom.add(pubkey);
         added += 1;
-        
+
         // Progress reporting every 100k pubkeys
         if added % 100000 == 0 {
             info!("Added {} pubkeys...", added);
         }
     }
-    
+
     info!("Successfully added all {} pubkeys to bloom filter", added);
-    
+
     // Serialize and write bloom filter to disk
     info!("Serializing bloom filter...");
     let serialized_bloom = bincode::serialize(&bloom)
         .map_err(|e| anyhow::anyhow!("Failed to serialize bloom filter: {}", e))?;
-    
+
     let serialized_size_mb = serialized_bloom.len() as f64 / (1024.0 * 1024.0);
     info!("Serialized bloom filter size: {:.2} MB", serialized_size_mb);
-    
+
     info!("Writing bloom filter to disk...");
-    std::fs::write(&output, &serialized_bloom)
-        .map_err(|e| anyhow::anyhow!("Failed to write bloom filter to {}: {}", output.display(), e))?;
-    
+    std::fs::write(&output, &serialized_bloom).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to write bloom filter to {}: {}",
+            output.display(),
+            e
+        )
+    })?;
+
     info!("Bloom filter successfully written to: {}", output.display());
     println!("Bloom filter created successfully!");
     println!("  - Input pubkeys: {}", num_pubkeys);
@@ -583,7 +674,7 @@ fn create_bloom_filter(snapshot: PathBuf, output: PathBuf, false_rate: f64) -> R
     println!("  - Serialized size: {:.2} MB", serialized_size_mb);
     println!("  - Hash functions: {}", bloom.keys.len());
     println!("  - Output file: {}", output.display());
-    
+
     Ok(())
 }
 
@@ -593,17 +684,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::CreateDb { snapshot, index, output, index_only } => {
-            create_database(snapshot, index, output, index_only)
-        },
-        Commands::Query { database, query } => {
-            run_query(database, query)
-        },
-        Commands::RunQuery { database, template, params } => {
-            run_template_query(database, template, params)
-        },
-        Commands::CreateBloom { snapshot, output, false_rate } => {
-            create_bloom_filter(snapshot, output, false_rate)
-        },
+        Commands::CreateDb {
+            snapshot,
+            index,
+            output,
+            index_only,
+        } => create_database(snapshot, index, output, index_only),
+        Commands::Query { database, query } => run_query(database, query),
+        Commands::RunQuery {
+            database,
+            template,
+            params,
+        } => run_template_query(database, template, params),
+        Commands::CreateBloom {
+            snapshot,
+            output,
+            false_rate,
+        } => create_bloom_filter(snapshot, output, false_rate),
     }
 }
