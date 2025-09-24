@@ -42,6 +42,10 @@ enum Commands {
         /// Output database file path
         #[arg(long, short = 'o')]
         output: PathBuf,
+        
+        /// Create database of accounts in index but not in snapshot (index-only accounts)
+        #[arg(long)]
+        index_only: bool,
     },
     
     /// Run SQL query on database
@@ -98,7 +102,7 @@ pub struct AccountMetadata {
 }
 
 
-fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result<()> {
+fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf, index_only: bool) -> Result<()> {
     info!("Creating database at: {}", output.display());
     
     // Remove existing database
@@ -107,7 +111,7 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
     }
     
     // Create SQLite connection
-    let mut conn = Connection::open(&output)?;
+    let conn = Connection::open(&output)?;
     
     // Optimize SQLite for bulk inserts
     conn.execute_batch(r#"
@@ -116,6 +120,104 @@ fn create_database(snapshot: PathBuf, index: PathBuf, output: PathBuf) -> Result
         PRAGMA cache_size = 100000;
         PRAGMA temp_store = MEMORY;
     "#)?;
+    
+    if index_only {
+        return create_index_only_database(conn, snapshot, index);
+    } else {
+        return create_standard_database(conn, snapshot, index);
+    }
+}
+
+fn create_index_only_database(mut conn: Connection, snapshot: PathBuf, index: PathBuf) -> Result<()> {
+    info!("Creating index-only database (accounts in index but not in snapshot)");
+    
+    // Create the index-only accounts table (no snapshot metadata)
+    conn.execute_batch(r#"
+        CREATE TABLE index_only_accounts (
+            account TEXT PRIMARY KEY,
+            top_read_epochs TEXT,
+            top_write_epochs TEXT,
+            read_count INTEGER,
+            write_count INTEGER,
+            max_read_epoch INTEGER,
+            max_write_epoch INTEGER,
+            total_activity_count INTEGER
+        );
+    "#)?;
+    
+    // Load account activity index
+    info!("Loading account activity index...");
+    let activity_map = load_account_activity_index(&index);
+    if activity_map.is_empty() {
+        return Err(anyhow::anyhow!("No activity entries loaded"));
+    }
+    
+    // Load snapshot to identify which accounts ARE in it
+    info!("Loading snapshot to identify accounts present in snapshot...");
+    let mut parser = SnapshotParser::new(&snapshot);
+    let accounts_in_snapshot = parser.parse_accounts(&activity_map)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
+    
+    info!("Identifying accounts in index but NOT in snapshot...");
+    let mut index_only_accounts = HashMap::new();
+    for (pubkey, activity) in &activity_map {
+        // If the account is NOT in the snapshot, it's index-only
+        if !accounts_in_snapshot.contains_key(pubkey) {
+            index_only_accounts.insert(pubkey.clone(), activity.clone());
+        }
+    }
+    
+    info!("Found {} accounts in index but not in snapshot", index_only_accounts.len());
+    info!("Inserting index-only accounts into database...");
+    
+    let tx = conn.transaction()?;
+    let mut stmt = tx.prepare(r#"
+        INSERT INTO index_only_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    "#)?;
+    
+    let mut inserted = 0;
+    
+    for (pubkey, activity) in &index_only_accounts {
+        let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
+        let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
+        let total_activity = activity.read_count + activity.write_count;
+        
+        // Convert arrays to JSON strings
+        let read_epochs_str = format!("[{}]", activity.top_read_epochs.iter()
+            .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+        let write_epochs_str = format!("[{}]", activity.top_write_epochs.iter()
+            .map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+        
+        stmt.execute((
+            &pubkey.to_string(),
+            &read_epochs_str,
+            &write_epochs_str,
+            activity.read_count as i32,
+            activity.write_count as i32,
+            max_read,
+            max_write,
+            total_activity as i32,
+        ))?;
+        
+        inserted += 1;
+        
+        // Progress reporting every 50k accounts
+        if inserted % 50000 == 0 {
+            info!("Inserted {} index-only accounts...", inserted);
+        }
+    }
+    
+    // Commit the transaction
+    drop(stmt);
+    tx.commit()?;
+    
+    info!("Index-only database created successfully with {} accounts", inserted);
+    println!("Index-only accounts added: {}", inserted);
+    Ok(())
+}
+
+fn create_standard_database(mut conn: Connection, snapshot: PathBuf, index: PathBuf) -> Result<()> {
+    info!("Creating standard database (accounts in both index and snapshot)");
     
     // Create the main accounts table
     conn.execute_batch(r#"
@@ -402,8 +504,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::CreateDb { snapshot, index, output } => {
-            create_database(snapshot, index, output)
+        Commands::CreateDb { snapshot, index, output, index_only } => {
+            create_database(snapshot, index, output, index_only)
         },
         Commands::Query { database, query } => {
             run_query(database, query)
