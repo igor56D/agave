@@ -136,13 +136,20 @@ fn create_database(
     // Create SQLite connection
     let conn = Connection::open(&output)?;
 
-    // Optimize SQLite for bulk inserts
+    // Optimize SQLite for bulk inserts (aggressive settings; machine has ample RAM)
+    // These pragmas are applied before any tables are created
     conn.execute_batch(
         r#"
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA cache_size = 100000;
+        PRAGMA foreign_keys = OFF;
+        PRAGMA locking_mode = EXCLUSIVE;
+        PRAGMA page_size = 32768;
+        PRAGMA journal_mode = OFF;
+        PRAGMA synchronous = OFF;
         PRAGMA temp_store = MEMORY;
+        -- Negative cache_size is KiB; here ~1 GiB cache
+        PRAGMA cache_size = -1048576;
+        -- Enable mmap to reduce syscall overhead if supported
+        PRAGMA mmap_size = 1073741824;
     "#,
     )?;
 
@@ -196,7 +203,8 @@ fn create_index_only_database(
         .build()
         .expect("Failed to create thread pool");
 
-    let index_only_accounts: HashMap<Pubkey, AccountActivity> = thread_pool.install(|| {
+    // Build as Vec to keep parallel collection efficient; consume the map to free memory
+    let mut index_only_accounts: Vec<(Pubkey, AccountActivity)> = thread_pool.install(|| {
         activity_map
             .into_par_iter()
             .filter(|(pubkey, _)| !accounts_in_snapshot.contains_key(pubkey))
@@ -209,6 +217,14 @@ fn create_index_only_database(
     );
     info!("Inserting index-only accounts into database...");
 
+    // Speed up inserts further by disabling autovacuum/analysis during load
+    conn.execute_batch(
+        r#"
+        PRAGMA analysis_limit=0;
+        PRAGMA optimize;
+    "#,
+    )?;
+
     let tx = conn.transaction()?;
     let mut stmt = tx.prepare(
         r#"
@@ -218,7 +234,7 @@ fn create_index_only_database(
 
     let mut inserted = 0;
 
-    for (pubkey, activity) in &index_only_accounts {
+    for (pubkey, activity) in index_only_accounts.drain(..) {
         let max_read = activity.top_read_epochs.iter().max().copied().unwrap_or(0) as i32;
         let max_write = activity.top_write_epochs.iter().max().copied().unwrap_or(0) as i32;
         let total_activity = activity.read_count + activity.write_count;
@@ -311,6 +327,14 @@ fn create_standard_database(mut conn: Connection, snapshot: PathBuf, index: Path
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
     info!("Inserting data into database...");
+
+    // Speed up inserts further by disabling analysis during load
+    conn.execute_batch(
+        r#"
+        PRAGMA analysis_limit=0;
+        PRAGMA optimize;
+    "#,
+    )?;
 
     // Use a single large transaction for maximum speed
     let tx = conn.transaction()?;

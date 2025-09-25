@@ -10,11 +10,7 @@ use {
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
         snapshot_utils::verify_and_unarchive_snapshots,
     },
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, Mutex},
-    },
+    std::{collections::HashMap, path::PathBuf, sync::Arc},
 };
 
 pub struct SnapshotParser {
@@ -80,43 +76,56 @@ impl SnapshotParser {
         Ok((temp_dir, storage_entries))
     }
 
-    /// Process storage entries in parallel with a custom processor function
-    fn process_storage_entries<T, F>(
+    /// Process storage entries in parallel (32 chunks), using per-thread accumulators
+    /// - init:       creates a local accumulator for a chunk
+    /// - processor:  updates the local accumulator for each account
+    /// - combine:    merges two accumulators into one
+    fn process_storage_entries<T, Init, Proc, Comb>(
         &self,
         storage_entries: Vec<(u64, Arc<AccountStorageEntry>)>,
-        initial_value: T,
-        processor: F,
+        init: Init,
+        processor: Proc,
+        combine: Comb,
     ) -> T
     where
-        T: Send + 'static + std::fmt::Debug,
-        F: Fn(&Arc<Mutex<T>>, &StoredAccountInfo) + Send + Sync,
+        T: Send + 'static,
+        Init: Fn() -> T + Sync,
+        Proc: Fn(&mut T, &StoredAccountInfo) + Send + Sync,
+        Comb: Fn(T, T) -> T + Send + Sync,
     {
-        let shared_data = Arc::new(Mutex::new(initial_value));
-
         // Configure rayon to use 32 threads
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(32)
             .build()
             .expect("Failed to create thread pool");
 
-        // Use rayon to process storage entries in parallel
-        thread_pool.install(|| {
-            storage_entries
-                .par_iter()
-                .for_each(|(slot, storage_entry)| {
-                    // Scan this storage entry (this is the I/O heavy part)
-                    let scan_result = storage_entry.accounts.scan_accounts(|_offset, account| {
-                        processor(&shared_data, &account);
-                    });
+        // Split storage entries into 32 chunks
+        let n_threads = 32usize;
+        let chunk_size = (storage_entries.len() + n_threads - 1) / n_threads;
 
-                    if let Err(e) = scan_result {
-                        warn!("Failed to scan storage for slot {}: {}", slot, e);
-                    }
-                });
+        let partials: Vec<T> = thread_pool.install(|| {
+            if chunk_size == 0 {
+                return Vec::new();
+            }
+            storage_entries
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut local = init();
+                    chunk.iter().for_each(|(slot, storage_entry)| {
+                        if let Err(e) = storage_entry
+                            .accounts
+                            .scan_accounts(|_offset, account| processor(&mut local, &account))
+                        {
+                            warn!("Failed to scan storage for slot {}: {}", slot, e);
+                        }
+                    });
+                    local
+                })
+                .collect()
         });
 
-        // Extract the final results
-        Arc::try_unwrap(shared_data).unwrap().into_inner().unwrap()
+        // Reduce all partials into a final result (or init() if none)
+        partials.into_iter().reduce(combine).unwrap_or_else(init)
     }
 
     pub fn parse_accounts(
@@ -124,15 +133,12 @@ impl SnapshotParser {
         activity_map: &HashMap<Pubkey, crate::AccountActivity>,
     ) -> Result<HashMap<Pubkey, crate::AccountMetadata>, Box<dyn std::error::Error>> {
         let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
-        let activity_map = activity_map.clone(); // Clone for move into closure
-
         let result = self.process_storage_entries(
             storage_entries,
-            HashMap::new(),
-            move |shared_accounts: &Arc<Mutex<HashMap<Pubkey, crate::AccountMetadata>>>,
-                  account: &StoredAccountInfo| {
+            || HashMap::<Pubkey, crate::AccountMetadata>::new(),
+            |local_accounts: &mut HashMap<Pubkey, crate::AccountMetadata>,
+             account: &StoredAccountInfo| {
                 let pubkey = *account.pubkey;
-
                 if activity_map.contains_key(&pubkey) {
                     let metadata = crate::AccountMetadata {
                         lamports: account.lamports,
@@ -140,10 +146,12 @@ impl SnapshotParser {
                         executable: account.executable,
                         data_size: account.data.len() as u64,
                     };
-
-                    let mut accounts = shared_accounts.lock().unwrap();
-                    accounts.insert(pubkey, metadata);
+                    local_accounts.insert(pubkey, metadata);
                 }
+            },
+            |mut a, b| {
+                a.extend(b);
+                a
             },
         );
 
@@ -160,10 +168,13 @@ impl SnapshotParser {
 
         let result = self.process_storage_entries(
             storage_entries,
-            Vec::new(),
-            |shared_pubkeys: &Arc<Mutex<Vec<Pubkey>>>, account: &StoredAccountInfo| {
-                let mut pubkeys = shared_pubkeys.lock().unwrap();
-                pubkeys.push(*account.pubkey);
+            || Vec::<Pubkey>::new(),
+            |local_pubkeys: &mut Vec<Pubkey>, account: &StoredAccountInfo| {
+                local_pubkeys.push(*account.pubkey);
+            },
+            |mut a, mut b| {
+                a.append(&mut b);
+                a
             },
         );
 
