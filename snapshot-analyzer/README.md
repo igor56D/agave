@@ -1,38 +1,92 @@
 # Agave Snapshot Analyzer
 
-A CLI tool for analyzing Solana snapshot data with two main capabilities:
-1. **Account staleness analysis** using a pre-built account access index
-2. **Block usage analysis** for bytes loaded per block in a slot range
+CLI for inspecting Solana snapshots and generating an embedded SQLite database to query account activity.
 
-## Overview
+## Subcommands
 
-### Staleness Analysis
-This tool determines how much account data has been accessed over various time periods by:
+### create-db
+Build an on-disk SQLite database from a snapshot and a pre-built account-activity index.
 
-- Loading account data from a Solana snapshot archive
-- Reading a pre-built index of account access data (sorted by slot)
-- Iterating through accounts in chronological order (newest to oldest access)
-- Tracking cumulative account counts and sizes as we cross time boundaries
-- Reporting account and size totals at 1, 2, 4, and 8 month intervals
-- Showing the total snapshot accounts and size for context
+```
+agave-snapshot-analyzer create-db \
+  -s /path/to/snapshot.tar.zst \
+  -i /path/to/activity_index.bin \
+  -o /path/to/output.db
 
-### Block Usage Analysis
-This tool analyzes bytes loaded per block by:
+# Index-only mode: include only accounts present in the index but not in the snapshot
+agave-snapshot-analyzer create-db -s snap.tar.zst -i idx.bin -o index_only.db --index-only
+```
 
-- Loading account data from a Solana snapshot archive
-- Fetching block data for each slot in a specified range via RPC
-- Extracting all account references from each block's transactions
-- Looking up account sizes in the snapshot data
-- Outputting a CSV file with slot number and total bytes loaded per block
+Creates:
+- `accounts` table (standard mode): snapshot metadata + activity metrics
+- `index_only_accounts` table (index-only mode): only activity metrics (no snapshot metadata)
 
-## How It Works
+The tool uses parallel snapshot scanning and applies bulk-load PRAGMAs to speed up inserts.
 
-1. **Snapshot Loading**: Parses snapshot to build account map with data sizes and calculates total size
-2. **Index Loading**: Reads bincode-serialized vector of `AccountSlotEntry` structs
-3. **Boundary Calculation**: Determines slot boundaries for 1/2/4/8 months ago
-4. **Iteration**: Processes index entries from newest to oldest access slot
-5. **Checkpoint Tracking**: Records cumulative sizes when crossing time boundaries
-6. **Report Generation**: Outputs total snapshot size and all checkpoints
+### run-query
+Execute a parameterized SQL template from `templates/`.
+
+```
+agave-snapshot-analyzer run-query -d output.db -t staleness -p current_epoch=600 -p lookback_epochs=50
+
+# Index-only staleness templates
+agave-snapshot-analyzer run-query -d index_only.db -t index_only_staleness
+agave-snapshot-analyzer run-query -d index_only.db -t index_only_staleness_breakdown
+```
+
+Available templates (see `templates/README.md`):
+- `staleness`
+- `most_active`
+- `owner_analysis`
+- `balance_range`
+- `size_distribution`
+- `read_write_ratio`
+- `index_only_staleness`
+- `index_only_staleness_breakdown`
+
+### query
+Run arbitrary SQL against the database.
+
+```
+agave-snapshot-analyzer query -d output.db -q "SELECT COUNT(*) FROM accounts"
+```
+
+### create-bloom
+Generate a bloom filter containing all pubkeys present in a snapshot. The filter is capped at 1 GB.
+
+```
+agave-snapshot-analyzer create-bloom \
+  -s /path/to/snapshot.tar.zst \
+  -o /path/to/pubkeys.bloom \
+  --false-rate 0.001
+```
+
+## Performance & Tuning
+
+The `create-db` pipeline is optimized for high-throughput bulk loads on large-memory machines:
+
+- Parallel snapshot scan (32 threads) with per-thread local aggregation
+- Index-only computation parallelized with rayon and a fixed 32-thread pool
+- Aggressive SQLite PRAGMAs during bulk load:
+  - `PRAGMA foreign_keys = OFF;`
+  - `PRAGMA locking_mode = EXCLUSIVE;`
+  - `PRAGMA page_size = 32768;`
+  - `PRAGMA journal_mode = OFF;`
+  - `PRAGMA synchronous = OFF;`
+  - `PRAGMA temp_store = MEMORY;`
+  - `PRAGMA cache_size = -1048576;`   (≈ 1 GiB)
+  - `PRAGMA mmap_size = 1073741824;`  (1 GiB)
+
+During insert phases, lightweight optimization hints are applied:
+  - `PRAGMA analysis_limit = 0;`
+  - `PRAGMA optimize;`
+
+Memory considerations:
+- Index-only accounts are collected into a `Vec<(Pubkey, AccountActivity)>` and drained during insertion to reduce peak memory usage.
+- Snapshot parsing and filtering are chunked to improve cache locality and avoid lock contention.
+
+Notes:
+- SQLite has a single-writer design; parallel writers do not help. This tool parallelizes preprocessing and uses one fast writer inside a single transaction.
 
 ## Input Format
 
@@ -47,16 +101,15 @@ pub struct AccountSlotEntry {
 
 The vector must be sorted from high to low slot (newest to oldest access).
 
-## Installation
+## Building
 
 ```bash
-cd snapshot-analyzer
-cargo build --release
+cargo build --release -p agave-snapshot-analyzer
 ```
 
-## Usage
+## Templates
 
-The tool now has two subcommands: `staleness` for account staleness analysis and `block-usage` for analyzing bytes loaded per block.
+See `snapshot-analyzer/templates/README.md` for details and examples.
 
 ### Staleness Analysis
 
@@ -304,4 +357,4 @@ This implementation is much simpler than CAR file processing approaches:
 
 ## License
 
-This project follows the same license as the Agave project. 
+This project follows the same license as the Agave project.
