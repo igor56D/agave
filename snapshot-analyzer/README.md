@@ -43,6 +43,7 @@ Available templates (see `templates/README.md`):
 - `read_write_ratio`
 - `index_only_staleness`
 - `index_only_staleness_breakdown`
+- `index_only_low_activity_count` (param: `n`, default: 1)
 
 ### query
 Run arbitrary SQL against the database.

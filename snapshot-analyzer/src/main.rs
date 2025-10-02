@@ -590,6 +590,9 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
                 .entry("lookback_epochs".to_string())
                 .or_insert("50".to_string());
         }
+        "index_only_low_activity_count" => {
+            param_map.entry("n".to_string()).or_insert("1".to_string());
+        }
         _ => {
             // No defaults for unknown templates
         }
