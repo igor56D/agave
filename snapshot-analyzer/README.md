@@ -44,6 +44,8 @@ Available templates (see `templates/README.md`):
 - `index_only_staleness`
 - `index_only_staleness_breakdown`
 - `index_only_low_activity_count` (param: `n`, default: 1)
+- `random_accounts` (param: `n`, default: 20)
+- `index_only_random_accounts` (param: `n`, default: 20)
 
 ### query
 Run arbitrary SQL against the database.
