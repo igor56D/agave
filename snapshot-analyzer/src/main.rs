@@ -593,6 +593,12 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
         "index_only_low_activity_count" => {
             param_map.entry("n".to_string()).or_insert("1".to_string());
         }
+        "arbitrary_accounts" => {
+            param_map.entry("n".to_string()).or_insert("20".to_string());
+        }
+        "index_only_arbitrary_accounts" => {
+            param_map.entry("n".to_string()).or_insert("20".to_string());
+        }
         "random_accounts" => {
             param_map.entry("n".to_string()).or_insert("20".to_string());
         }
