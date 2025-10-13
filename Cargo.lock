@@ -7108,6 +7108,7 @@ dependencies = [
  "solana-account",
  "solana-accounts-db",
  "solana-address-lookup-table-interface",
+ "solana-bloom",
  "solana-bucket-map",
  "solana-clock",
  "solana-compute-budget",

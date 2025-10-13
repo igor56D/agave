@@ -66,6 +66,7 @@ solana-address-lookup-table-interface = { workspace = true, features = [
     "bytemuck",
 ] }
 solana-bucket-map = { workspace = true }
+solana-bloom = { workspace = true }
 solana-clock = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-fee-calculator = { workspace = true }

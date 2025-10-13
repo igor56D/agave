@@ -1,3 +1,4 @@
+use solana_bloom::counting_bloom::ConcurrentCountingBloom;
 use {
     crate::{
         accounts_index::{
@@ -95,6 +96,9 @@ pub struct InMemAccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<
 
     bucket: Option<Arc<BucketApi<(Slot, U)>>>,
 
+    /// Counting bloom filter for keys present on disk in this bin.
+    disk_keys_bloom: Option<Arc<ConcurrentCountingBloom<Pubkey>>>,
+
     // set to true while this bin is being actively flushed
     flushing_active: AtomicBool,
 
@@ -175,6 +179,18 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         let bin_calc = PubkeyBinCalculator24::new(storage.bins);
         let lowest_pubkey = bin_calc.lowest_pubkey_from_bin(bin);
         let highest_pubkey = bin_calc.highest_pubkey_from_bin(bin);
+        // Configure a small counting bloom per bin
+        const EXPECTED_PER_BIN: usize = 100_000;
+        const FP_RATE: f64 = 1e-2; // relaxed FP to reduce memory
+        const MAX_BITS: usize = 1_200_000; // ~1.2 MB/bin with u8 counters
+        let bloom = storage.disk.as_ref().map(|_| {
+            Arc::new(ConcurrentCountingBloom::random(
+                EXPECTED_PER_BIN,
+                FP_RATE,
+                MAX_BITS,
+            ))
+        });
+
         Self {
             map_internal: RwLock::default(),
             storage: Arc::clone(storage),
@@ -186,6 +202,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                 .as_ref()
                 .map(|disk| disk.get_bucket_from_index(bin))
                 .cloned(),
+            disk_keys_bloom: bloom,
             flushing_active: AtomicBool::default(),
             // initialize this to max, to make it clear we have not flushed at age 0, the starting age
             last_age_flushed: AtomicAge::new(Age::MAX),
@@ -247,6 +264,13 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     }
 
     fn load_from_disk(&self, pubkey: &Pubkey) -> Option<(SlotList<U>, RefCount)> {
+        // Bloom-based fast negative
+        if let Some(bloom) = &self.disk_keys_bloom {
+            if !bloom.contains(pubkey) {
+                return None;
+            }
+        }
+
         self.bucket.as_ref().and_then(|disk| {
             let m = Measure::start("load_disk_found_count");
             let entry_disk = disk.read_value(pubkey);
@@ -381,6 +405,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     fn delete_disk_key(&self, pubkey: &Pubkey) {
         if let Some(disk) = self.bucket.as_ref() {
             disk.delete_key(pubkey)
+        }
+        if let Some(bloom) = &self.disk_keys_bloom {
+            bloom.remove(pubkey);
         }
     }
 
@@ -1003,6 +1030,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         }
 
         self.stats().inc_insert_count(count);
+        // seed bloom with all inserted keys
+        if let Some(bloom) = &self.disk_keys_bloom {
+            for (k, _) in insert.iter() {
+                bloom.add(k);
+            }
+        }
     }
 
     /// pull out all duplicate pubkeys from 'startup_info'
@@ -1181,6 +1214,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                                 Ok(_) => {
                                     // successfully written to disk
                                     flush_stats.flush_entries_updated_on_disk += 1;
+                                    if let Some(bloom) = &self.disk_keys_bloom {
+                                        bloom.add(&k);
+                                    }
                                     // exit disk-resize loop
                                     break;
                                 }
