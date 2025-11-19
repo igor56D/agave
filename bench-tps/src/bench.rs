@@ -24,7 +24,9 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc_client_api::request::MAX_MULTIPLE_ACCOUNTS,
     solana_signer::Signer,
-    solana_system_interface::instruction as system_instruction,
+    solana_system_interface::{
+        instruction as system_instruction, program as system_program, MAX_PERMITTED_DATA_LENGTH,
+    },
     solana_time_utils::timestamp,
     solana_tps_client::*,
     solana_transaction::Transaction,
@@ -648,24 +650,33 @@ fn transfer_with_compute_unit_price_and_padding(
     skip_tx_account_data_size: bool,
 ) -> Transaction {
     let from_pubkey = from_keypair.pubkey();
-    let transfer_instruction = system_instruction::transfer(&from_pubkey, to, lamports);
+    let create_instruction = system_instruction::create_account(
+        &from_pubkey,
+        to,
+        lamports,
+        MAX_PERMITTED_DATA_LENGTH,
+        &system_program::id(),
+    );
     let instruction = if let Some(instruction_padding_config) = instruction_padding_config {
         wrap_instruction(
             instruction_padding_config.program_id,
-            transfer_instruction,
+            create_instruction,
             vec![],
             instruction_padding_config.data_size,
         )
         .expect("Could not create padded instruction")
     } else {
-        transfer_instruction
+        create_instruction
     };
     let mut instructions = vec![];
     if !skip_tx_account_data_size {
+        let loaded_accounts_limit = if instruction_padding_config.is_some() {
+            (MAX_PERMITTED_DATA_LENGTH as u32).saturating_add(PADDING_PROGRAM_ACCOUNT_DATA_SIZE)
+        } else {
+            MAX_PERMITTED_DATA_LENGTH as u32
+        };
         instructions.push(
-            ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(
-                get_transaction_loaded_accounts_data_size(instruction_padding_config.is_some()),
-            ),
+            ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(loaded_accounts_limit),
         )
     }
     instructions.push(instruction);
