@@ -34,6 +34,7 @@ pub struct TransactionExecutionDetails {
     pub inner_instructions: Option<InnerInstructionsList>,
     pub return_data: Option<TransactionReturnData>,
     pub executed_units: u64,
+    pub execution_time_us: u64,
     /// The change in accounts data len for this transaction.
     /// NOTE: This value is valid IFF `status` is `Ok`.
     pub accounts_data_len_delta: i64,

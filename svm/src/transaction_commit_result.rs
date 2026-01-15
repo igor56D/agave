@@ -14,6 +14,7 @@ pub struct CommittedTransaction {
     pub inner_instructions: Option<InnerInstructionsList>,
     pub return_data: Option<TransactionReturnData>,
     pub executed_units: u64,
+    pub execution_time_us: u64,
     pub fee_details: FeeDetails,
     pub loaded_account_stats: TransactionLoadedAccountsStats,
     pub fee_payer_post_balance: u64,

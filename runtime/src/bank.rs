@@ -3814,6 +3814,7 @@ impl Bank {
                             inner_instructions: execution_details.inner_instructions,
                             return_data: execution_details.return_data,
                             executed_units,
+                            execution_time_us: execution_details.execution_time_us,
                             fee_details,
                             loaded_account_stats: TransactionLoadedAccountsStats {
                                 loaded_accounts_count: loaded_accounts.len(),
@@ -3828,6 +3829,7 @@ impl Bank {
                         inner_instructions: None,
                         return_data: None,
                         executed_units,
+                        execution_time_us: 0,
                         fee_details: fees_only_tx.fee_details,
                         loaded_account_stats: TransactionLoadedAccountsStats {
                             loaded_accounts_count: fees_only_tx.rollback_accounts.count(),

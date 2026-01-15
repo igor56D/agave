@@ -1077,6 +1077,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 inner_instructions,
                 return_data,
                 executed_units,
+                execution_time_us: process_message_time.as_us(),
                 accounts_data_len_delta,
             },
             loaded_transaction,

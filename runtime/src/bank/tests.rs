@@ -246,6 +246,7 @@ fn new_executed_processing_result(
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
+                execution_time_us: 0,
                 accounts_data_len_delta: 0,
             },
             programs_modified_by_tx: HashMap::new(),
@@ -1994,6 +1995,7 @@ fn test_load_and_execute_commit_transactions_fees_only() {
             inner_instructions: None,
             return_data: None,
             executed_units: 0,
+            execution_time_us: 0,
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 2,
@@ -2069,6 +2071,7 @@ fn test_load_and_execute_commit_transactions_failure() {
             inner_instructions: Some(vec![vec![], vec![]]),
             return_data: None,
             executed_units: 300,
+            execution_time_us: 0,
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 3,
@@ -2137,6 +2140,7 @@ fn test_load_and_execute_commit_transactions_success() {
             inner_instructions: Some(vec![vec![]]),
             return_data: None,
             executed_units: 150,
+            execution_time_us: 0,
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 3,

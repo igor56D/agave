@@ -604,8 +604,56 @@ fn read_banking_trace_event_file_paths_or_exit(banking_trace_path: PathBuf) -> V
 struct SlotRecorderConfig {
     transaction_recorder: Option<JoinHandle<()>>,
     transaction_status_sender: Option<TransactionStatusSender>,
-    slot_details: Arc<Mutex<Vec<SlotDetails>>>,
+    slot_details: Option<Arc<Mutex<Vec<SlotDetails>>>>,
+    file: Option<File>,
+}
+
+struct TxTimingCsvConfig {
     file: File,
+    warmup_slots: u64,
+}
+
+struct TxTimingCsvWriter {
+    writer: std::io::BufWriter<File>,
+    warmup_slots: u64,
+    current_slot: Option<Slot>,
+    seen_slots: u64,
+}
+
+impl TxTimingCsvWriter {
+    fn new(config: TxTimingCsvConfig) -> Self {
+        let mut writer = std::io::BufWriter::new(config.file);
+        writeln!(writer, "signature,execution_time_us,executed_units")
+            .expect("csv header write should succeed");
+        Self {
+            writer,
+            warmup_slots: config.warmup_slots,
+            current_slot: None,
+            seen_slots: 0,
+        }
+    }
+
+    fn observe_slot(&mut self, slot: Slot) {
+        if self.current_slot != Some(slot) {
+            self.current_slot = Some(slot);
+            self.seen_slots = self.seen_slots.saturating_add(1);
+        }
+    }
+
+    fn is_warmed_up(&self) -> bool {
+        self.seen_slots > self.warmup_slots
+    }
+
+    fn write_row(&mut self, signature: &str, execution_time_us: u64, executed_units: u64) {
+        if self.is_warmed_up() {
+            writeln!(
+                self.writer,
+                "{},{},{}",
+                signature, execution_time_us, executed_units
+            )
+            .expect("csv row write should succeed");
+        }
+    }
 }
 
 fn setup_slot_recording(
@@ -613,6 +661,24 @@ fn setup_slot_recording(
 ) -> (Option<ProcessSlotCallback>, Option<SlotRecorderConfig>) {
     let record_slots = arg_matches.occurrences_of("record_slots") > 0;
     let verify_slots = arg_matches.occurrences_of("verify_slots") > 0;
+    let record_tx_timing_csv = arg_matches.value_of_os("record_tx_timing_csv");
+    let tx_timing_warmup_slots =
+        value_t_or_exit!(arg_matches, "tx_timing_warmup_slots", u64);
+    let tx_timing_csv = record_tx_timing_csv.map(|path| {
+        let filename = Path::new(path);
+        let file = File::create(filename).unwrap_or_else(|err| {
+            eprintln!(
+                "Unable to write to tx timing csv file: {}: {:#}",
+                filename.display(),
+                err
+            );
+            exit(1);
+        });
+        TxTimingCsvConfig {
+            file,
+            warmup_slots: tx_timing_warmup_slots,
+        }
+    });
     match (record_slots, verify_slots) {
         (false, false) => {
             // for regualr replay ledger, report cost-tracker-stats after each
@@ -640,7 +706,18 @@ fn setup_slot_recording(
                 );
             });
 
-            (Some(slot_callback as ProcessSlotCallback), None)
+            let (transaction_status_sender, transaction_recorder) =
+                setup_transaction_recorder(None, tx_timing_csv);
+            let slot_recorder_config = transaction_recorder.map(|transaction_recorder| {
+                SlotRecorderConfig {
+                    transaction_recorder: Some(transaction_recorder),
+                    transaction_status_sender,
+                    slot_details: None,
+                    file: None,
+                }
+            });
+
+            (Some(slot_callback as ProcessSlotCallback), slot_recorder_config)
         }
         (true, true) => {
             // .default_value() does not work with .conflicts_with() in clap 2.33
@@ -673,24 +750,9 @@ fn setup_slot_recording(
             }
 
             let slot_details = Arc::new(Mutex::new(Vec::new()));
-            let (transaction_status_sender, transaction_recorder) = if include_tx {
-                let (sender, receiver) = crossbeam_channel::unbounded();
-
-                let slots = Arc::clone(&slot_details);
-                let transaction_recorder = Some(std::thread::spawn(move || {
-                    record_transactions(receiver, slots);
-                }));
-
-                (
-                    Some(TransactionStatusSender {
-                        sender,
-                        dependency_tracker: None,
-                    }),
-                    transaction_recorder,
-                )
-            } else {
-                (None, None)
-            };
+            let slot_details_for_tx = include_tx.then(|| Arc::clone(&slot_details));
+            let (transaction_status_sender, transaction_recorder) =
+                setup_transaction_recorder(slot_details_for_tx, tx_timing_csv);
 
             let slot_callback = Arc::new({
                 let slots = Arc::clone(&slot_details);
@@ -718,8 +780,8 @@ fn setup_slot_recording(
                 Some(SlotRecorderConfig {
                     transaction_recorder,
                     transaction_status_sender,
-                    slot_details,
-                    file,
+                    slot_details: Some(slot_details),
+                    file: Some(file),
                 }),
             )
         }
@@ -763,75 +825,148 @@ fn setup_slot_recording(
                 }
             });
 
-            (Some(slot_callback as ProcessSlotCallback), None)
+            let (transaction_status_sender, transaction_recorder) =
+                setup_transaction_recorder(None, tx_timing_csv);
+            let slot_recorder_config = transaction_recorder.map(|transaction_recorder| {
+                SlotRecorderConfig {
+                    transaction_recorder: Some(transaction_recorder),
+                    transaction_status_sender,
+                    slot_details: None,
+                    file: None,
+                }
+            });
+
+            (Some(slot_callback as ProcessSlotCallback), slot_recorder_config)
         }
     }
 }
 
+fn setup_transaction_recorder(
+    slot_details: Option<Arc<Mutex<Vec<SlotDetails>>>>,
+    tx_timing_csv: Option<TxTimingCsvConfig>,
+) -> (Option<TransactionStatusSender>, Option<JoinHandle<()>>) {
+    if slot_details.is_none() && tx_timing_csv.is_none() {
+        return (None, None);
+    }
+
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let transaction_recorder = std::thread::spawn(move || {
+        record_transactions(receiver, slot_details, tx_timing_csv);
+    });
+
+    (
+        Some(TransactionStatusSender {
+            sender,
+            dependency_tracker: None,
+        }),
+        Some(transaction_recorder),
+    )
+}
+
 fn record_transactions(
     recv: crossbeam_channel::Receiver<TransactionStatusMessage>,
-    slots: Arc<Mutex<Vec<SlotDetails>>>,
+    slots: Option<Arc<Mutex<Vec<SlotDetails>>>>,
+    tx_timing_csv: Option<TxTimingCsvConfig>,
 ) {
+    let mut tx_timing_writer = tx_timing_csv.map(TxTimingCsvWriter::new);
+
     for tsm in recv {
-        if let TransactionStatusMessage::Batch((batch, _work_sequence)) = tsm {
-            assert_eq!(batch.transactions.len(), batch.commit_results.len());
+        match tsm {
+            TransactionStatusMessage::Batch((batch, _work_sequence)) => {
+                assert_eq!(batch.transactions.len(), batch.commit_results.len());
 
-            let transactions: Vec<_> = batch
-                .transactions
-                .iter()
-                .zip(batch.commit_results)
-                .zip(batch.transaction_indexes)
-                .map(|((tx, commit_result), index)| {
-                    let message = tx.message();
+                if let Some(writer) = tx_timing_writer.as_mut() {
+                    writer.observe_slot(batch.slot);
+                }
 
-                    let accounts: Vec<String> = message
-                        .account_keys()
-                        .iter()
-                        .map(|acc| acc.to_string())
-                        .collect();
+                let mut transactions = slots
+                    .as_ref()
+                    .map(|_| Vec::with_capacity(batch.transactions.len()));
 
-                    let instructions = message
-                        .instructions()
-                        .iter()
-                        .map(|ix| {
-                            parse_ui_instruction(
-                                ix,
-                                &message.account_keys(),
-                                Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
-                            )
-                        })
-                        .collect();
-
-                    let is_simple_vote_tx = tx.is_simple_vote_transaction();
-                    let commit_details = commit_result.ok().map(|committed_tx| committed_tx.into());
-
-                    TransactionDetails {
-                        signature: tx.signature().to_string(),
-                        accounts,
-                        instructions,
-                        is_simple_vote_tx,
-                        commit_details,
-                        index,
+                for ((tx, commit_result), index) in batch
+                    .transactions
+                    .iter()
+                    .zip(batch.commit_results.iter())
+                    .zip(batch.transaction_indexes.iter().copied())
+                {
+                    if let Some(writer) = tx_timing_writer.as_mut() {
+                        if let Ok(committed_tx) = commit_result {
+                            writer.write_row(
+                                &tx.signature().to_string(),
+                                committed_tx.execution_time_us,
+                                committed_tx.executed_units,
+                            );
+                        }
                     }
-                })
-                .collect();
 
-            let mut slots = slots.lock().unwrap();
+                    if let Some(transactions) = transactions.as_mut() {
+                        let message = tx.message();
 
-            if let Some(recorded_slot) = slots.iter_mut().find(|f| f.slot == batch.slot) {
-                recorded_slot.transactions.extend(transactions);
-            } else {
-                slots.push(SlotDetails {
-                    slot: batch.slot,
-                    transactions,
-                    ..Default::default()
-                });
+                        let accounts: Vec<String> = message
+                            .account_keys()
+                            .iter()
+                            .map(|acc| acc.to_string())
+                            .collect();
+
+                        let instructions = message
+                            .instructions()
+                            .iter()
+                            .map(|ix| {
+                                parse_ui_instruction(
+                                    ix,
+                                    &message.account_keys(),
+                                    Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
+                                )
+                            })
+                            .collect();
+
+                        let is_simple_vote_tx = tx.is_simple_vote_transaction();
+                        let commit_details = commit_result
+                            .as_ref()
+                            .ok()
+                            .map(|committed_tx| committed_tx.clone().into());
+
+                        transactions.push(TransactionDetails {
+                            signature: tx.signature().to_string(),
+                            accounts,
+                            instructions,
+                            is_simple_vote_tx,
+                            commit_details,
+                            index,
+                        });
+                    }
+                }
+
+                if let (Some(transactions), Some(slots)) = (transactions, slots.as_ref()) {
+                    let mut slots = slots.lock().unwrap();
+
+                    if let Some(recorded_slot) = slots.iter_mut().find(|f| f.slot == batch.slot) {
+                        recorded_slot.transactions.extend(transactions);
+                    } else {
+                        slots.push(SlotDetails {
+                            slot: batch.slot,
+                            transactions,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            TransactionStatusMessage::Freeze(bank) => {
+                if let Some(writer) = tx_timing_writer.as_mut() {
+                    writer.observe_slot(bank.slot());
+                }
             }
         }
     }
 
-    for slot in slots.lock().unwrap().iter_mut() {
-        slot.transactions.sort_by(|a, b| a.index.cmp(&b.index));
+    if let Some(writer) = tx_timing_writer.as_mut() {
+        let _ = writer.writer.flush();
+    }
+
+    if let Some(slots) = slots {
+        for slot in slots.lock().unwrap().iter_mut() {
+            slot.transactions.sort_by(|a, b| a.index.cmp(&b.index));
+        }
     }
 }
 
@@ -1201,6 +1336,24 @@ fn main() {
                         .default_value("slots.json")
                         .value_name("FILENAME")
                         .help("Record slots to a file"),
+                )
+                .arg(
+                    Arg::with_name("record_tx_timing_csv")
+                        .long("record-tx-timing-csv")
+                        .value_name("FILENAME")
+                        .takes_value(true)
+                        .help(
+                            "Record per-transaction execution time (us) and executed units to CSV",
+                        ),
+                )
+                .arg(
+                    Arg::with_name("tx_timing_warmup_slots")
+                        .long("tx-timing-warmup-slots")
+                        .value_name("SLOTS")
+                        .takes_value(true)
+                        .default_value("0")
+                        .validator(is_parsable::<u64>)
+                        .help("Skip recording tx timing for the first N slots"),
                 )
                 .arg(
                     Arg::with_name("verify_slots")
@@ -1924,15 +2077,19 @@ fn main() {
                         {
                             transaction_recorder.join().unwrap();
                         }
+                        if let (Some(slot_details), Some(file)) = (
+                            slot_recorder_config.slot_details.take(),
+                            slot_recorder_config.file.take(),
+                        ) {
+                            let slot_details = slot_details.lock().unwrap();
+                            let bank_hashes =
+                                bank_hash_details::BankHashDetails::new(slot_details.to_vec());
 
-                        let slot_details = slot_recorder_config.slot_details.lock().unwrap();
-                        let bank_hashes =
-                            bank_hash_details::BankHashDetails::new(slot_details.to_vec());
-
-                        // writing the json file ends up with a syscall for each number, comma, indentation etc.
-                        // use BufWriter to speed things up
-                        let writer = std::io::BufWriter::new(slot_recorder_config.file);
-                        serde_json::to_writer_pretty(writer, &bank_hashes).unwrap();
+                            // writing the json file ends up with a syscall for each number, comma, indentation etc.
+                            // use BufWriter to speed things up
+                            let writer = std::io::BufWriter::new(file);
+                            serde_json::to_writer_pretty(writer, &bank_hashes).unwrap();
+                        }
                     }
 
                     exit_signal.store(true, Ordering::Relaxed);

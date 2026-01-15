@@ -196,6 +196,7 @@ mod tests {
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
+                    execution_time_us: 0,
                     accounts_data_len_delta: 0,
                 },
                 loaded_transaction,
