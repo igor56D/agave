@@ -447,6 +447,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // in the same batch may modify the same accounts. Transaction order is
         // preserved within entries written to the ledger.
         for (tx, check_result) in sanitized_txs.iter().zip(check_results) {
+            let mut tx_total_time = Measure::start("tx_total_time");
             let (validate_result, validate_fees_us) =
                 measure_us!(check_result.and_then(|tx_details| {
                     Self::validate_transaction_nonce_and_fee_payer(
@@ -476,7 +477,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
 
-            let (processing_result, single_execution_us) = measure_us!(match load_result {
+            let (mut processing_result, single_execution_us) = measure_us!(match load_result {
                 TransactionLoadResult::NotLoaded(err) => Err(err),
                 TransactionLoadResult::FeesOnly(fees_only_tx) => match config.drop_on_failure {
                     true => Err(fees_only_tx.load_error),
@@ -541,6 +542,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         &mut program_cache_for_tx_batch,
                         environment,
                         config,
+                        0,
                     );
 
                     match (
@@ -583,6 +585,12 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 measure_us!(balance_collector.collect_post_balances(&mut account_loader, tx));
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
+
+            tx_total_time.stop();
+            let tx_total_time_us = tx_total_time.as_us();
+            if let Ok(ProcessedTransaction::Executed(ref mut executed_tx)) = processing_result {
+                executed_tx.execution_details.execution_time_us = tx_total_time_us;
+            }
 
             // If this is an all or nothing batch and we failed to process this transaction then we
             // must abort all prior/remaining transactions.
@@ -926,6 +934,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         program_cache_for_tx_batch: &mut ProgramCacheForTxBatch,
         environment: &TransactionProcessingEnvironment,
         config: &TransactionProcessingConfig,
+        execution_time_us: u64,
     ) -> ExecutedTransaction {
         let transaction_accounts = std::mem::take(&mut loaded_transaction.accounts);
 
@@ -1077,7 +1086,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 inner_instructions,
                 return_data,
                 executed_units,
-                execution_time_us: process_message_time.as_us(),
+                execution_time_us,
                 accounts_data_len_delta,
             },
             loaded_transaction,
@@ -1461,6 +1470,7 @@ mod tests {
             &mut program_cache_for_tx_batch,
             &processing_environment,
             &processing_config,
+            0,
         );
         assert!(executed_tx.execution_details.log_messages.is_some());
 
@@ -1475,6 +1485,7 @@ mod tests {
             &mut program_cache_for_tx_batch,
             &processing_environment,
             &processing_config,
+            0,
         );
         assert!(executed_tx.execution_details.log_messages.is_some());
         assert!(executed_tx.execution_details.inner_instructions.is_none());
@@ -1492,6 +1503,7 @@ mod tests {
             &mut program_cache_for_tx_batch,
             &processing_environment,
             &processing_config,
+            0,
         );
 
         assert!(executed_tx.execution_details.log_messages.is_none());
@@ -1556,6 +1568,7 @@ mod tests {
             &mut program_cache_for_tx_batch,
             &TransactionProcessingEnvironment::default(),
             &processing_config,
+            0,
         );
 
         assert_eq!(error_metrics.instruction_error.0, 1);

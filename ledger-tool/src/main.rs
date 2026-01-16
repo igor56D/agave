@@ -611,13 +611,17 @@ struct SlotRecorderConfig {
 struct TxTimingCsvConfig {
     file: File,
     warmup_slots: u64,
+    log_interval_slots: Option<u64>,
 }
 
 struct TxTimingCsvWriter {
     writer: std::io::BufWriter<File>,
     warmup_slots: u64,
+    log_interval_slots: Option<u64>,
     current_slot: Option<Slot>,
     seen_slots: u64,
+    total_rows: u64,
+    interval_rows: u64,
 }
 
 impl TxTimingCsvWriter {
@@ -628,8 +632,11 @@ impl TxTimingCsvWriter {
         Self {
             writer,
             warmup_slots: config.warmup_slots,
+            log_interval_slots: config.log_interval_slots,
             current_slot: None,
             seen_slots: 0,
+            total_rows: 0,
+            interval_rows: 0,
         }
     }
 
@@ -652,6 +659,24 @@ impl TxTimingCsvWriter {
                 signature, execution_time_us, executed_units
             )
             .expect("csv row write should succeed");
+            self.total_rows = self.total_rows.saturating_add(1);
+            self.interval_rows = self.interval_rows.saturating_add(1);
+        }
+    }
+
+    fn maybe_checkpoint(&mut self) {
+        let interval = match self.log_interval_slots {
+            Some(interval) if interval > 0 => interval,
+            _ => return,
+        };
+        if self.is_warmed_up() && (self.seen_slots % interval == 0) {
+            let current_slot = self.current_slot.unwrap_or_default();
+            println!(
+                "tx timing checkpoint: slot={current_slot} slots_seen={} rows_total={} rows_interval={}",
+                self.seen_slots, self.total_rows, self.interval_rows
+            );
+            self.interval_rows = 0;
+            let _ = self.writer.flush();
         }
     }
 }
@@ -662,8 +687,9 @@ fn setup_slot_recording(
     let record_slots = arg_matches.occurrences_of("record_slots") > 0;
     let verify_slots = arg_matches.occurrences_of("verify_slots") > 0;
     let record_tx_timing_csv = arg_matches.value_of_os("record_tx_timing_csv");
-    let tx_timing_warmup_slots =
-        value_t_or_exit!(arg_matches, "tx_timing_warmup_slots", u64);
+    let tx_timing_warmup_slots = value_t_or_exit!(arg_matches, "tx_timing_warmup_slots", u64);
+    let tx_timing_log_interval_slots =
+        value_t!(arg_matches, "tx_timing_log_interval_slots", u64).ok();
     let tx_timing_csv = record_tx_timing_csv.map(|path| {
         let filename = Path::new(path);
         let file = File::create(filename).unwrap_or_else(|err| {
@@ -677,6 +703,7 @@ fn setup_slot_recording(
         TxTimingCsvConfig {
             file,
             warmup_slots: tx_timing_warmup_slots,
+            log_interval_slots: tx_timing_log_interval_slots,
         }
     });
     match (record_slots, verify_slots) {
@@ -708,16 +735,18 @@ fn setup_slot_recording(
 
             let (transaction_status_sender, transaction_recorder) =
                 setup_transaction_recorder(None, tx_timing_csv);
-            let slot_recorder_config = transaction_recorder.map(|transaction_recorder| {
-                SlotRecorderConfig {
+            let slot_recorder_config =
+                transaction_recorder.map(|transaction_recorder| SlotRecorderConfig {
                     transaction_recorder: Some(transaction_recorder),
                     transaction_status_sender,
                     slot_details: None,
                     file: None,
-                }
-            });
+                });
 
-            (Some(slot_callback as ProcessSlotCallback), slot_recorder_config)
+            (
+                Some(slot_callback as ProcessSlotCallback),
+                slot_recorder_config,
+            )
         }
         (true, true) => {
             // .default_value() does not work with .conflicts_with() in clap 2.33
@@ -827,16 +856,18 @@ fn setup_slot_recording(
 
             let (transaction_status_sender, transaction_recorder) =
                 setup_transaction_recorder(None, tx_timing_csv);
-            let slot_recorder_config = transaction_recorder.map(|transaction_recorder| {
-                SlotRecorderConfig {
+            let slot_recorder_config =
+                transaction_recorder.map(|transaction_recorder| SlotRecorderConfig {
                     transaction_recorder: Some(transaction_recorder),
                     transaction_status_sender,
                     slot_details: None,
                     file: None,
-                }
-            });
+                });
 
-            (Some(slot_callback as ProcessSlotCallback), slot_recorder_config)
+            (
+                Some(slot_callback as ProcessSlotCallback),
+                slot_recorder_config,
+            )
         }
     }
 }
@@ -877,6 +908,7 @@ fn record_transactions(
 
                 if let Some(writer) = tx_timing_writer.as_mut() {
                     writer.observe_slot(batch.slot);
+                    writer.maybe_checkpoint();
                 }
 
                 let mut transactions = slots
@@ -954,6 +986,7 @@ fn record_transactions(
             TransactionStatusMessage::Freeze(bank) => {
                 if let Some(writer) = tx_timing_writer.as_mut() {
                     writer.observe_slot(bank.slot());
+                    writer.maybe_checkpoint();
                 }
             }
         }
@@ -1354,6 +1387,14 @@ fn main() {
                         .default_value("0")
                         .validator(is_parsable::<u64>)
                         .help("Skip recording tx timing for the first N slots"),
+                )
+                .arg(
+                    Arg::with_name("tx_timing_log_interval_slots")
+                        .long("tx-timing-log-interval-slots")
+                        .value_name("SLOTS")
+                        .takes_value(true)
+                        .validator(is_parsable::<u64>)
+                        .help("Log/flush tx timing CSV every N slots (only after warmup)"),
                 )
                 .arg(
                     Arg::with_name("verify_slots")
