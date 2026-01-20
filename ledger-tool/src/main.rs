@@ -75,6 +75,7 @@ use {
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_shred_version::compute_shred_version,
     solana_stake_interface::{self as stake, state::StakeStateV2},
+    solana_svm::transaction_execution_result::TransactionExecutionTimings,
     solana_system_interface::program as system_program,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_status::parse_ui_instruction,
@@ -614,6 +615,20 @@ struct TxTimingCsvConfig {
     log_interval_slots: Option<u64>,
 }
 
+struct TxTimingRow {
+    signature: String,
+    execution_time_us: u64,
+    execution_timings: TransactionExecutionTimings,
+    executed_units: u64,
+    cost_signature: u64,
+    cost_write_lock: u64,
+    cost_data_bytes: u64,
+    cost_programs_execution: u64,
+    cost_loaded_accounts_data_size: u64,
+    cost_allocated_accounts_data_size: u64,
+    cost_total: u64,
+}
+
 struct TxTimingCsvWriter {
     writer: std::io::BufWriter<File>,
     warmup_slots: u64,
@@ -627,7 +642,10 @@ struct TxTimingCsvWriter {
 impl TxTimingCsvWriter {
     fn new(config: TxTimingCsvConfig) -> Self {
         let mut writer = std::io::BufWriter::new(config.file);
-        writeln!(writer, "signature,execution_time_us,executed_units")
+        writeln!(
+            writer,
+            "signature,execution_time_us,validate_fees_us,load_us,execute_us,collect_balances_us,filter_executable_us,program_cache_us,executed_units,cost_signature,cost_write_lock,cost_data_bytes,cost_programs_execution,cost_loaded_accounts_data_size,cost_allocated_accounts_data_size,cost_total"
+        )
             .expect("csv header write should succeed");
         Self {
             writer,
@@ -651,12 +669,27 @@ impl TxTimingCsvWriter {
         self.seen_slots > self.warmup_slots
     }
 
-    fn write_row(&mut self, signature: &str, execution_time_us: u64, executed_units: u64) {
+    fn write_row(&mut self, row: TxTimingRow) {
         if self.is_warmed_up() {
             writeln!(
                 self.writer,
-                "{},{},{}",
-                signature, execution_time_us, executed_units
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                row.signature,
+                row.execution_time_us,
+                row.execution_timings.validate_fees_us,
+                row.execution_timings.load_us,
+                row.execution_timings.execute_us,
+                row.execution_timings.collect_balances_us,
+                row.execution_timings.filter_executable_us,
+                row.execution_timings.program_cache_us,
+                row.executed_units,
+                row.cost_signature,
+                row.cost_write_lock,
+                row.cost_data_bytes,
+                row.cost_programs_execution,
+                row.cost_loaded_accounts_data_size,
+                row.cost_allocated_accounts_data_size,
+                row.cost_total
             )
             .expect("csv row write should succeed");
             self.total_rows = self.total_rows.saturating_add(1);
@@ -923,11 +956,28 @@ fn record_transactions(
                 {
                     if let Some(writer) = tx_timing_writer.as_mut() {
                         if let Ok(committed_tx) = commit_result {
-                            writer.write_row(
-                                &tx.signature().to_string(),
-                                committed_tx.execution_time_us,
+                            let tx_cost = CostModel::calculate_cost_for_executed_transaction(
+                                tx,
                                 committed_tx.executed_units,
+                                committed_tx.loaded_account_stats.loaded_accounts_data_size,
+                                &batch.feature_set,
                             );
+                            let row = TxTimingRow {
+                                signature: tx.signature().to_string(),
+                                execution_time_us: committed_tx.execution_time_us,
+                                execution_timings: committed_tx.execution_timings.clone(),
+                                executed_units: committed_tx.executed_units,
+                                cost_signature: tx_cost.signature_cost(),
+                                cost_write_lock: tx_cost.write_lock_cost(),
+                                cost_data_bytes: u64::from(tx_cost.data_bytes_cost()),
+                                cost_programs_execution: tx_cost.programs_execution_cost(),
+                                cost_loaded_accounts_data_size: tx_cost
+                                    .loaded_accounts_data_size_cost(),
+                                cost_allocated_accounts_data_size: tx_cost
+                                    .allocated_accounts_data_size(),
+                                cost_total: tx_cost.sum(),
+                            };
+                            writer.write_row(row);
                         }
                     }
 

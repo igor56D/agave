@@ -164,7 +164,9 @@ mod tests {
         solana_signer::{signers::Signers, Signer},
         solana_svm::{
             account_loader::{FeesOnlyTransaction, LoadedTransaction},
-            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+            transaction_execution_result::{
+                ExecutedTransaction, TransactionExecutionDetails, TransactionExecutionTimings,
+            },
         },
         solana_system_interface::{instruction as system_instruction, program as system_program},
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
@@ -197,6 +199,7 @@ mod tests {
                     return_data: None,
                     executed_units: 0,
                     execution_time_us: 0,
+                    execution_timings: TransactionExecutionTimings::default(),
                     accounts_data_len_delta: 0,
                 },
                 loaded_transaction,

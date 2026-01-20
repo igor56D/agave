@@ -179,6 +179,7 @@ impl Committer {
 
             transaction_status_sender.send_transaction_status_batch(
                 bank.slot(),
+                Arc::clone(&bank.feature_set),
                 txs,
                 commit_results,
                 balances,

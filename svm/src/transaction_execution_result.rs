@@ -14,6 +14,16 @@ pub struct TransactionLoadedAccountsStats {
     pub loaded_accounts_count: usize,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TransactionExecutionTimings {
+    pub validate_fees_us: u64,
+    pub load_us: u64,
+    pub execute_us: u64,
+    pub collect_balances_us: u64,
+    pub filter_executable_us: u64,
+    pub program_cache_us: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutedTransaction {
     pub loaded_transaction: LoadedTransaction,
@@ -35,6 +45,7 @@ pub struct TransactionExecutionDetails {
     pub return_data: Option<TransactionReturnData>,
     pub executed_units: u64,
     pub execution_time_us: u64,
+    pub execution_timings: TransactionExecutionTimings,
     /// The change in accounts data len for this transaction.
     /// NOTE: This value is valid IFF `status` is `Ok`.
     pub accounts_data_len_delta: i64,

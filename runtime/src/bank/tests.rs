@@ -99,7 +99,7 @@ use {
         account_loader::{FeesOnlyTransaction, LoadedTransaction, TRANSACTION_ACCOUNT_BASE_SIZE},
         rollback_accounts::RollbackAccounts,
         transaction_commit_result::TransactionCommitResultExtensions,
-        transaction_execution_result::ExecutedTransaction,
+        transaction_execution_result::{ExecutedTransaction, TransactionExecutionTimings},
     },
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -247,6 +247,7 @@ fn new_executed_processing_result(
                 return_data: None,
                 executed_units: 0,
                 execution_time_us: 0,
+                execution_timings: TransactionExecutionTimings::default(),
                 accounts_data_len_delta: 0,
             },
             programs_modified_by_tx: HashMap::new(),
@@ -1996,6 +1997,7 @@ fn test_load_and_execute_commit_transactions_fees_only() {
             return_data: None,
             executed_units: 0,
             execution_time_us: 0,
+            execution_timings: TransactionExecutionTimings::default(),
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 2,
@@ -2072,6 +2074,7 @@ fn test_load_and_execute_commit_transactions_failure() {
             return_data: None,
             executed_units: 300,
             execution_time_us: 0,
+            execution_timings: TransactionExecutionTimings::default(),
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 3,
@@ -2141,6 +2144,7 @@ fn test_load_and_execute_commit_transactions_success() {
             return_data: None,
             executed_units: 150,
             execution_time_us: 0,
+            execution_timings: TransactionExecutionTimings::default(),
             fee_details: FeeDetails::new(5000, 0),
             loaded_account_stats: TransactionLoadedAccountsStats {
                 loaded_accounts_count: 3,

@@ -132,6 +132,7 @@ impl TransactionStatusService {
             TransactionStatusMessage::Batch((
                 TransactionStatusBatch {
                     slot,
+                    feature_set: _,
                     transactions,
                     commit_results,
                     balances,
@@ -337,6 +338,7 @@ pub(crate) mod tests {
     use {
         super::*,
         crate::transaction_notifier_interface::TransactionNotifier,
+        agave_feature_set::FeatureSet,
         agave_reserved_account_keys::ReservedAccountKeys,
         crossbeam_channel::unbounded,
         dashmap::DashMap,
@@ -356,7 +358,9 @@ pub(crate) mod tests {
         solana_runtime::bank::{Bank, TransactionBalancesSet},
         solana_signature::Signature,
         solana_signer::Signer,
-        solana_svm::transaction_execution_result::TransactionLoadedAccountsStats,
+        solana_svm::transaction_execution_result::{
+            TransactionExecutionTimings, TransactionLoadedAccountsStats,
+        },
         solana_system_transaction as system_transaction,
         solana_transaction::{
             sanitized::{MessageHash, SanitizedTransaction},
@@ -466,6 +470,7 @@ pub(crate) mod tests {
             return_data: None,
             executed_units: 0,
             execution_time_us: 0,
+            execution_timings: TransactionExecutionTimings::default(),
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
             fee_payer_post_balance: 0,
@@ -510,6 +515,7 @@ pub(crate) mod tests {
         let transaction_index: usize = bank.transaction_count().try_into().unwrap();
         let transaction_status_batch = TransactionStatusBatch {
             slot,
+            feature_set: Arc::new(FeatureSet::default()),
             transactions: vec![transaction],
             commit_results: vec![commit_result],
             balances,
@@ -598,6 +604,7 @@ pub(crate) mod tests {
             return_data: None,
             executed_units: 0,
             execution_time_us: 0,
+            execution_timings: TransactionExecutionTimings::default(),
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
             fee_payer_post_balance: 0,
@@ -619,6 +626,7 @@ pub(crate) mod tests {
 
         let transaction_status_batch = TransactionStatusBatch {
             slot,
+            feature_set: Arc::new(FeatureSet::default()),
             transactions: vec![transaction1, transaction2],
             commit_results: vec![commit_result.clone(), commit_result],
             balances: balances.clone(),

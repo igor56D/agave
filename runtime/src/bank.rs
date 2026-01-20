@@ -147,7 +147,7 @@ use {
         transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_execution_result::{
-            TransactionExecutionDetails, TransactionLoadedAccountsStats,
+            TransactionExecutionDetails, TransactionExecutionTimings, TransactionLoadedAccountsStats,
         },
         transaction_processing_result::{
             ProcessedTransaction, TransactionProcessingResult,
@@ -3815,6 +3815,7 @@ impl Bank {
                             return_data: execution_details.return_data,
                             executed_units,
                             execution_time_us: execution_details.execution_time_us,
+                            execution_timings: execution_details.execution_timings,
                             fee_details,
                             loaded_account_stats: TransactionLoadedAccountsStats {
                                 loaded_accounts_count: loaded_accounts.len(),
@@ -3830,6 +3831,7 @@ impl Bank {
                         return_data: None,
                         executed_units,
                         execution_time_us: 0,
+                        execution_timings: TransactionExecutionTimings::default(),
                         fee_details: fees_only_tx.fee_details,
                         loaded_account_stats: TransactionLoadedAccountsStats {
                             loaded_accounts_count: fees_only_tx.rollback_accounts.count(),

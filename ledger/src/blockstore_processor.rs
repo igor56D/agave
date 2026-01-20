@@ -8,6 +8,7 @@ use {
         transaction_balances::compile_collected_balances,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
+    agave_feature_set::FeatureSet,
     agave_snapshots::snapshot_config::SnapshotConfig,
     chrono_humanize::{Accuracy, HumanTime, Tense},
     crossbeam_channel::Sender,
@@ -295,6 +296,7 @@ pub fn execute_batch<'a>(
 
         transaction_status_sender.send_transaction_status_batch(
             bank.slot(),
+            Arc::clone(&bank.feature_set),
             transactions,
             commit_results,
             balances,
@@ -2224,6 +2226,7 @@ pub enum TransactionStatusMessage {
 #[derive(Debug)]
 pub struct TransactionStatusBatch {
     pub slot: Slot,
+    pub feature_set: Arc<FeatureSet>,
     pub transactions: Vec<SanitizedTransaction>,
     pub commit_results: Vec<TransactionCommitResult>,
     pub balances: TransactionBalancesSet,
@@ -2242,6 +2245,7 @@ impl TransactionStatusSender {
     pub fn send_transaction_status_batch(
         &self,
         slot: Slot,
+        feature_set: Arc<FeatureSet>,
         transactions: Vec<SanitizedTransaction>,
         commit_results: Vec<TransactionCommitResult>,
         balances: TransactionBalancesSet,
@@ -2257,6 +2261,7 @@ impl TransactionStatusSender {
         if let Err(e) = self.sender.send(TransactionStatusMessage::Batch((
             TransactionStatusBatch {
                 slot,
+                feature_set,
                 transactions,
                 commit_results,
                 balances,
