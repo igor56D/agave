@@ -214,6 +214,9 @@ impl SnapshotParser {
                 accounts: Vec::new(),
             },
             |local_report: &mut RentPayingAccountReport, account: &StoredAccountInfo| {
+                if account.lamports == 0 {
+                    return;
+                }
                 local_report.stats.total_accounts += 1;
                 let data_len = account.data.len();
                 let min_balance = rent.minimum_balance(data_len);
