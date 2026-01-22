@@ -6,12 +6,19 @@ use {
         accounts_file::StorageAccess,
     },
     solana_pubkey::Pubkey,
+    solana_rent::Rent,
     solana_runtime::{
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
         snapshot_utils::verify_and_unarchive_snapshots,
     },
     std::{collections::HashMap, path::PathBuf, sync::Arc},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct RentPayingAccountStats {
+    pub total_accounts: u64,
+    pub rent_paying_accounts: u64,
+}
 
 pub struct SnapshotParser {
     pub snapshot_path: PathBuf,
@@ -183,5 +190,40 @@ impl SnapshotParser {
 
         info!("Found {} total pubkeys", result.len());
         Ok(result)
+    }
+
+    pub fn count_rent_paying_accounts(
+        &mut self,
+        rent: &Rent,
+    ) -> Result<RentPayingAccountStats, Box<dyn std::error::Error>> {
+        let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
+
+        let stats = self.process_storage_entries(
+            storage_entries,
+            || RentPayingAccountStats {
+                total_accounts: 0,
+                rent_paying_accounts: 0,
+            },
+            |local_stats: &mut RentPayingAccountStats, account: &StoredAccountInfo| {
+                local_stats.total_accounts += 1;
+                let data_len = account.data.len();
+                let min_balance = rent.minimum_balance(data_len);
+                if account.lamports < min_balance {
+                    local_stats.rent_paying_accounts += 1;
+                }
+            },
+            |a, b| RentPayingAccountStats {
+                total_accounts: a.total_accounts + b.total_accounts,
+                rent_paying_accounts: a.rent_paying_accounts + b.rent_paying_accounts,
+            },
+        );
+
+        self.temp_dir = Some(temp_dir);
+
+        info!(
+            "Rent-paying accounts: {} of {} total",
+            stats.rent_paying_accounts, stats.total_accounts
+        );
+        Ok(stats)
     }
 }

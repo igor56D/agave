@@ -10,6 +10,7 @@ use {
     snapshot_parser::SnapshotParser,
     solana_bloom::bloom::Bloom,
     solana_pubkey::Pubkey,
+    solana_rent::Rent,
     std::{
         collections::HashMap,
         path::{Path, PathBuf},
@@ -91,6 +92,13 @@ enum Commands {
         /// False positive rate (default: 0.01 = 1%)
         #[arg(long, default_value = "0.01")]
         false_rate: f64,
+    },
+
+    /// Report accounts below the rent-exempt minimum
+    RentPaying {
+        /// Path to the snapshot archive file
+        #[arg(long, short = 's')]
+        snapshot: PathBuf,
     },
 }
 
@@ -740,6 +748,45 @@ fn create_bloom_filter(snapshot: PathBuf, output: PathBuf, false_rate: f64) -> R
     Ok(())
 }
 
+fn report_rent_paying_accounts(snapshot: PathBuf) -> Result<()> {
+    let rent = Rent::default();
+    info!(
+        "Using rent config: lamports_per_byte_year={}, exemption_threshold={}, burn_percent={}",
+        rent.lamports_per_byte_year, rent.exemption_threshold, rent.burn_percent
+    );
+
+    let mut parser = SnapshotParser::new(&snapshot);
+    let stats = parser
+        .count_rent_paying_accounts(&rent)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
+
+    if stats.total_accounts == 0 {
+        println!("No accounts found in snapshot.");
+        return Ok(());
+    }
+
+    let rent_paying_pct =
+        (stats.rent_paying_accounts as f64 / stats.total_accounts as f64) * 100.0;
+    let rent_exempt_accounts = stats.total_accounts - stats.rent_paying_accounts;
+
+    println!("Total accounts: {}", stats.total_accounts);
+    println!("Rent-exempt accounts: {}", rent_exempt_accounts);
+    println!(
+        "Rent-paying accounts: {} ({:.4}%)",
+        stats.rent_paying_accounts, rent_paying_pct
+    );
+    println!(
+        "Any rent-paying accounts: {}",
+        if stats.rent_paying_accounts > 0 {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     solana_logger::setup();
 
@@ -763,5 +810,6 @@ fn main() -> Result<()> {
             output,
             false_rate,
         } => create_bloom_filter(snapshot, output, false_rate),
+        Commands::RentPaying { snapshot } => report_rent_paying_accounts(snapshot),
     }
 }

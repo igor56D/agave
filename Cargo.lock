@@ -354,6 +354,7 @@ dependencies = [
  "solana-clock",
  "solana-logger",
  "solana-pubkey",
+ "solana-rent",
  "solana-runtime",
  "tabled",
  "tempfile",

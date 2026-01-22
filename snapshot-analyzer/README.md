@@ -64,6 +64,13 @@ agave-snapshot-analyzer create-bloom \
   --false-rate 0.001
 ```
 
+### rent-paying
+Report whether any accounts are below the rent-exempt minimum based on their lamports balance.
+
+```
+agave-snapshot-analyzer rent-paying -s /path/to/snapshot.tar.zst
+```
+
 ## Performance & Tuning
 
 The `create-db` pipeline is optimized for high-throughput bulk loads on large-memory machines:
