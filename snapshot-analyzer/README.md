@@ -68,7 +68,7 @@ agave-snapshot-analyzer create-bloom \
 Report whether any accounts are below the rent-exempt minimum based on their lamports balance.
 
 ```
-agave-snapshot-analyzer rent-paying -s /path/to/snapshot.tar.zst
+agave-snapshot-analyzer rent-paying -s /path/to/snapshot.tar.zst -o rent-paying-accounts.txt
 ```
 
 ## Performance & Tuning

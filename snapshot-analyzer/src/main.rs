@@ -13,6 +13,8 @@ use {
     solana_rent::Rent,
     std::{
         collections::HashMap,
+        fs::File,
+        io::{BufWriter, Write},
         path::{Path, PathBuf},
     },
     tabled::{builder::Builder, settings::Style},
@@ -99,6 +101,10 @@ enum Commands {
         /// Path to the snapshot archive file
         #[arg(long, short = 's')]
         snapshot: PathBuf,
+
+        /// Output file to write rent-paying account addresses (one per line)
+        #[arg(long, short = 'o')]
+        output: PathBuf,
     },
 }
 
@@ -748,7 +754,7 @@ fn create_bloom_filter(snapshot: PathBuf, output: PathBuf, false_rate: f64) -> R
     Ok(())
 }
 
-fn report_rent_paying_accounts(snapshot: PathBuf) -> Result<()> {
+fn report_rent_paying_accounts(snapshot: PathBuf, output: PathBuf) -> Result<()> {
     let rent = Rent::default();
     info!(
         "Using rent config: lamports_per_byte_year={}, exemption_threshold={}, burn_percent={}",
@@ -756,33 +762,53 @@ fn report_rent_paying_accounts(snapshot: PathBuf) -> Result<()> {
     );
 
     let mut parser = SnapshotParser::new(&snapshot);
-    let stats = parser
-        .count_rent_paying_accounts(&rent)
+    let report = parser
+        .collect_rent_paying_accounts(&rent)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
-    if stats.total_accounts == 0 {
+    if report.stats.total_accounts == 0 {
         println!("No accounts found in snapshot.");
         return Ok(());
     }
 
-    let rent_paying_pct =
-        (stats.rent_paying_accounts as f64 / stats.total_accounts as f64) * 100.0;
-    let rent_exempt_accounts = stats.total_accounts - stats.rent_paying_accounts;
+    let rent_paying_pct = (report.stats.rent_paying_accounts as f64
+        / report.stats.total_accounts as f64)
+        * 100.0;
+    let rent_exempt_accounts =
+        report.stats.total_accounts - report.stats.rent_paying_accounts;
 
-    println!("Total accounts: {}", stats.total_accounts);
+    info!(
+        "Writing {} rent-paying accounts to {}",
+        report.stats.rent_paying_accounts,
+        output.display()
+    );
+    let file = File::create(&output).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create output file {}: {}",
+            output.display(),
+            e
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+    for pubkey in &report.accounts {
+        writeln!(writer, "{}", pubkey)?;
+    }
+
+    println!("Total accounts: {}", report.stats.total_accounts);
     println!("Rent-exempt accounts: {}", rent_exempt_accounts);
     println!(
         "Rent-paying accounts: {} ({:.4}%)",
-        stats.rent_paying_accounts, rent_paying_pct
+        report.stats.rent_paying_accounts, rent_paying_pct
     );
     println!(
         "Any rent-paying accounts: {}",
-        if stats.rent_paying_accounts > 0 {
+        if report.stats.rent_paying_accounts > 0 {
             "yes"
         } else {
             "no"
         }
     );
+    println!("Rent-paying account addresses written to: {}", output.display());
 
     Ok(())
 }
@@ -810,6 +836,8 @@ fn main() -> Result<()> {
             output,
             false_rate,
         } => create_bloom_filter(snapshot, output, false_rate),
-        Commands::RentPaying { snapshot } => report_rent_paying_accounts(snapshot),
+        Commands::RentPaying { snapshot, output } => {
+            report_rent_paying_accounts(snapshot, output)
+        }
     }
 }

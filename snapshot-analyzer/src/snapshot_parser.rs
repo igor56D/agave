@@ -20,6 +20,12 @@ pub struct RentPayingAccountStats {
     pub rent_paying_accounts: u64,
 }
 
+#[derive(Debug)]
+pub struct RentPayingAccountReport {
+    pub stats: RentPayingAccountStats,
+    pub accounts: Vec<Pubkey>,
+}
+
 pub struct SnapshotParser {
     pub snapshot_path: PathBuf,
     pub temp_dir: Option<tempfile::TempDir>,
@@ -192,29 +198,40 @@ impl SnapshotParser {
         Ok(result)
     }
 
-    pub fn count_rent_paying_accounts(
+    pub fn collect_rent_paying_accounts(
         &mut self,
         rent: &Rent,
-    ) -> Result<RentPayingAccountStats, Box<dyn std::error::Error>> {
+    ) -> Result<RentPayingAccountReport, Box<dyn std::error::Error>> {
         let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
 
-        let stats = self.process_storage_entries(
+        let report = self.process_storage_entries(
             storage_entries,
-            || RentPayingAccountStats {
-                total_accounts: 0,
-                rent_paying_accounts: 0,
+            || RentPayingAccountReport {
+                stats: RentPayingAccountStats {
+                    total_accounts: 0,
+                    rent_paying_accounts: 0,
+                },
+                accounts: Vec::new(),
             },
-            |local_stats: &mut RentPayingAccountStats, account: &StoredAccountInfo| {
-                local_stats.total_accounts += 1;
+            |local_report: &mut RentPayingAccountReport, account: &StoredAccountInfo| {
+                local_report.stats.total_accounts += 1;
                 let data_len = account.data.len();
                 let min_balance = rent.minimum_balance(data_len);
                 if account.lamports < min_balance {
-                    local_stats.rent_paying_accounts += 1;
+                    local_report.stats.rent_paying_accounts += 1;
+                    local_report.accounts.push(*account.pubkey);
                 }
             },
-            |a, b| RentPayingAccountStats {
-                total_accounts: a.total_accounts + b.total_accounts,
-                rent_paying_accounts: a.rent_paying_accounts + b.rent_paying_accounts,
+            |mut a, mut b| RentPayingAccountReport {
+                stats: RentPayingAccountStats {
+                    total_accounts: a.stats.total_accounts + b.stats.total_accounts,
+                    rent_paying_accounts: a.stats.rent_paying_accounts
+                        + b.stats.rent_paying_accounts,
+                },
+                accounts: {
+                    a.accounts.append(&mut b.accounts);
+                    a.accounts
+                },
             },
         );
 
@@ -222,8 +239,8 @@ impl SnapshotParser {
 
         info!(
             "Rent-paying accounts: {} of {} total",
-            stats.rent_paying_accounts, stats.total_accounts
+            report.stats.rent_paying_accounts, report.stats.total_accounts
         );
-        Ok(stats)
+        Ok(report)
     }
 }
