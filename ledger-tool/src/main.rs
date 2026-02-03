@@ -944,6 +944,11 @@ fn record_transactions(
                     writer.maybe_checkpoint();
                 }
 
+                let reserved_account_keys = ReservedAccountKeys::new_all_activated();
+                let enable_static_instruction_limit = batch
+                    .feature_set
+                    .is_active(&agave_feature_set::static_instruction_limit::id());
+
                 let mut transactions = slots
                     .as_ref()
                     .map(|_| Vec::with_capacity(batch.transactions.len()));
@@ -956,26 +961,55 @@ fn record_transactions(
                 {
                     if let Some(writer) = tx_timing_writer.as_mut() {
                         if let Ok(committed_tx) = commit_result {
-                            let tx_cost = CostModel::calculate_cost_for_executed_transaction(
-                                tx,
-                                committed_tx.executed_units,
-                                committed_tx.loaded_account_stats.loaded_accounts_data_size,
-                                &batch.feature_set,
-                            );
+                            let (
+                                cost_signature,
+                                cost_write_lock,
+                                cost_data_bytes,
+                                cost_programs_execution,
+                                cost_loaded_accounts_data_size,
+                                cost_allocated_accounts_data_size,
+                                cost_total,
+                            ) = RuntimeTransaction::try_create(
+                                tx.to_versioned_transaction(),
+                                MessageHash::Compute,
+                                None,
+                                SimpleAddressLoader::Disabled,
+                                &reserved_account_keys.active,
+                                enable_static_instruction_limit,
+                            )
+                            .map(|runtime_tx| {
+                                let tx_cost = CostModel::calculate_cost_for_executed_transaction(
+                                    &runtime_tx,
+                                    committed_tx.executed_units,
+                                    committed_tx.loaded_account_stats.loaded_accounts_data_size,
+                                    &batch.feature_set,
+                                );
+                                (
+                                    tx_cost.signature_cost(),
+                                    tx_cost.write_lock_cost(),
+                                    u64::from(tx_cost.data_bytes_cost()),
+                                    tx_cost.programs_execution_cost(),
+                                    tx_cost.loaded_accounts_data_size_cost(),
+                                    tx_cost.allocated_accounts_data_size(),
+                                    tx_cost.sum(),
+                                )
+                            })
+                            .unwrap_or_else(|err| {
+                                warn!("Failed to compute tx cost for {}: {err:?}", tx.signature());
+                                (0, 0, 0, 0, 0, 0, 0)
+                            });
                             let row = TxTimingRow {
                                 signature: tx.signature().to_string(),
                                 execution_time_us: committed_tx.execution_time_us,
                                 execution_timings: committed_tx.execution_timings.clone(),
                                 executed_units: committed_tx.executed_units,
-                                cost_signature: tx_cost.signature_cost(),
-                                cost_write_lock: tx_cost.write_lock_cost(),
-                                cost_data_bytes: u64::from(tx_cost.data_bytes_cost()),
-                                cost_programs_execution: tx_cost.programs_execution_cost(),
-                                cost_loaded_accounts_data_size: tx_cost
-                                    .loaded_accounts_data_size_cost(),
-                                cost_allocated_accounts_data_size: tx_cost
-                                    .allocated_accounts_data_size(),
-                                cost_total: tx_cost.sum(),
+                                cost_signature,
+                                cost_write_lock,
+                                cost_data_bytes,
+                                cost_programs_execution,
+                                cost_loaded_accounts_data_size,
+                                cost_allocated_accounts_data_size,
+                                cost_total,
                             };
                             writer.write_row(row);
                         }
