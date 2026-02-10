@@ -7,7 +7,7 @@ use {
     rayon::prelude::*,
     rusqlite::Connection,
     serde::{Deserialize, Serialize},
-    snapshot_parser::SnapshotParser,
+    snapshot_parser::{BankSysvarSnapshotValues, SnapshotParser},
     solana_bloom::bloom::Bloom,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -105,6 +105,13 @@ enum Commands {
         /// Output file to write rent-paying account addresses (one per line)
         #[arg(long, short = 'o')]
         output: PathBuf,
+    },
+
+    /// Check that snapshot-serialized Bank fields match their corresponding sysvar accounts
+    CheckSysvars {
+        /// Path to the snapshot archive file
+        #[arg(long, short = 's')]
+        snapshot: PathBuf,
     },
 }
 
@@ -813,6 +820,80 @@ fn report_rent_paying_accounts(snapshot: PathBuf, output: PathBuf) -> Result<()>
     Ok(())
 }
 
+fn print_sysvar_check(
+    name: &str,
+    matches: Option<bool>,
+    details: &str,
+) {
+    match matches {
+        Some(true) => println!("[OK]   {name}: {details}"),
+        Some(false) => println!("[FAIL] {name}: {details}"),
+        None => println!("[SKIP] {name}: sysvar account not present in snapshot"),
+    }
+}
+
+fn check_snapshot_sysvars(snapshot: PathBuf) -> Result<()> {
+    info!("Checking snapshot sysvars for consistency: {}", snapshot.display());
+
+    let mut parser = SnapshotParser::new(&snapshot);
+    let BankSysvarSnapshotValues {
+        bank_rent,
+        snapshot_rent,
+        bank_epoch_schedule,
+        snapshot_epoch_schedule,
+    } = parser
+        .collect_bank_and_sysvar_values()
+        .map_err(|e| anyhow::anyhow!("Failed to collect bank/sysvar values from snapshot: {e}"))?;
+
+    println!("Snapshot sysvar consistency check");
+    println!("  Snapshot: {}", snapshot.display());
+    println!();
+
+    let mut any_mismatch = false;
+
+    // Rent
+    let rent_matches = snapshot_rent
+        .as_ref()
+        .map(|rent_sysvar| rent_sysvar == &bank_rent);
+    if let Some(false) = rent_matches {
+        any_mismatch = true;
+    }
+    let rent_details = match snapshot_rent {
+        Some(ref rent_sysvar) => format!(
+            "bank rent = {:?}, sysvar rent = {:?}",
+            bank_rent, rent_sysvar
+        ),
+        None => String::from("rent sysvar account not found"),
+    };
+    print_sysvar_check("rent", rent_matches, &rent_details);
+
+    // Epoch schedule
+    let epoch_matches = snapshot_epoch_schedule
+        .as_ref()
+        .map(|epoch_sysvar| epoch_sysvar == &bank_epoch_schedule);
+    if let Some(false) = epoch_matches {
+        any_mismatch = true;
+    }
+    let epoch_details = match snapshot_epoch_schedule {
+        Some(ref epoch_sysvar) => format!(
+            "bank epoch_schedule = {:?}, sysvar epoch_schedule = {:?}",
+            bank_epoch_schedule, epoch_sysvar
+        ),
+        None => String::from("epoch_schedule sysvar account not found"),
+    };
+    print_sysvar_check("epoch_schedule", epoch_matches, &epoch_details);
+
+    if any_mismatch {
+        Err(anyhow::anyhow!(
+            "Snapshot contains mismatches between Bank fields and sysvar accounts"
+        ))
+    } else {
+        println!();
+        println!("All checked Bank fields match their corresponding sysvar accounts.");
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     solana_logger::setup();
 
@@ -838,6 +919,9 @@ fn main() -> Result<()> {
         } => create_bloom_filter(snapshot, output, false_rate),
         Commands::RentPaying { snapshot, output } => {
             report_rent_paying_accounts(snapshot, output)
+        }
+        Commands::CheckSysvars { snapshot } => {
+            check_snapshot_sysvars(snapshot)
         }
     }
 }

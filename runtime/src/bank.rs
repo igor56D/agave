@@ -447,6 +447,22 @@ pub struct BankFieldsToDeserialize {
     pub(crate) bank_hash_stats: BankHashStats,
 }
 
+impl BankFieldsToDeserialize {
+    /// Accessor for the snapshot's `RentCollector`.
+    /// Intended for tooling that needs to compare serialized Bank fields
+    /// against other snapshot state (for example, sysvar accounts).
+    pub fn rent_collector_for_snapshot(&self) -> &RentCollector {
+        &self.rent_collector
+    }
+
+    /// Accessor for the snapshot's `EpochSchedule`.
+    /// Intended for tooling that needs to compare serialized Bank fields
+    /// against other snapshot state.
+    pub fn epoch_schedule_for_snapshot(&self) -> &EpochSchedule {
+        &self.epoch_schedule
+    }
+}
+
 /// Bank's common fields shared by all supported snapshot versions for serialization.
 /// This was separated from BankFieldsToDeserialize to avoid cloning by using refs.
 /// So, sync fields with BankFieldsToDeserialize!

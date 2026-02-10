@@ -1,16 +1,20 @@
 use {
+    bincode,
     log::*,
     rayon::prelude::*,
     solana_accounts_db::{
         account_storage::stored_account_info::StoredAccountInfo, accounts_db::AccountStorageEntry,
         accounts_file::StorageAccess,
     },
+    solana_epoch_schedule::EpochSchedule,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_runtime::{
+        bank::BankFieldsToDeserialize,
         snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
         snapshot_utils::verify_and_unarchive_snapshots,
     },
+    solana_sysvar as sysvar,
     std::{collections::HashMap, path::PathBuf, sync::Arc},
 };
 
@@ -42,8 +46,14 @@ impl SnapshotParser {
     /// Common snapshot parsing setup - returns the unpacked snapshot data for processing
     fn setup_snapshot_parsing(
         &mut self,
-    ) -> Result<(tempfile::TempDir, Vec<(u64, Arc<AccountStorageEntry>)>), Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            Vec<(u64, Arc<AccountStorageEntry>)>,
+            BankFieldsToDeserialize,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         info!("Parsing snapshot: {}", self.snapshot_path.display());
 
         // Parse the snapshot archive info
@@ -81,12 +91,16 @@ impl SnapshotParser {
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
+        // Extract the bank fields for later comparisons with sysvar accounts.
+        // If an incremental snapshot is present, prefer its (more recent) fields.
+        let bank_fields = unarchived_snapshots.bank_fields.collapse_into();
+
         info!(
             "Processing {} storage entries with 32 parallel threads",
             storage_entries.len()
         );
 
-        Ok((temp_dir, storage_entries))
+        Ok((temp_dir, storage_entries, bank_fields))
     }
 
     /// Process storage entries in parallel (32 chunks), using per-thread accumulators
@@ -145,7 +159,7 @@ impl SnapshotParser {
         &mut self,
         activity_map: &HashMap<Pubkey, crate::AccountActivity>,
     ) -> Result<HashMap<Pubkey, crate::AccountMetadata>, Box<dyn std::error::Error>> {
-        let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
         let result = self.process_storage_entries(
             storage_entries,
             || HashMap::<Pubkey, crate::AccountMetadata>::new(),
@@ -177,7 +191,7 @@ impl SnapshotParser {
 
     /// Parse all pubkeys from the snapshot (not filtered by activity index)
     pub fn parse_all_pubkeys(&mut self) -> Result<Vec<Pubkey>, Box<dyn std::error::Error>> {
-        let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
 
         let result = self.process_storage_entries(
             storage_entries,
@@ -202,7 +216,7 @@ impl SnapshotParser {
         &mut self,
         rent: &Rent,
     ) -> Result<RentPayingAccountReport, Box<dyn std::error::Error>> {
-        let (temp_dir, storage_entries) = self.setup_snapshot_parsing()?;
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
 
         let report = self.process_storage_entries(
             storage_entries,
@@ -246,4 +260,84 @@ impl SnapshotParser {
         );
         Ok(report)
     }
+
+    /// Collects snapshot sysvar account values and the corresponding serialized Bank fields
+    /// from the snapshot, to allow consistency checks between them.
+    ///
+    /// Currently this covers:
+    /// - Bank's `rent_collector.rent` field vs the `sysvar::rent` account
+    /// - Bank's `epoch_schedule` field vs the `sysvar::epoch_schedule` account
+    pub fn collect_bank_and_sysvar_values(
+        &mut self,
+    ) -> Result<BankSysvarSnapshotValues, Box<dyn std::error::Error>> {
+        let (temp_dir, storage_entries, bank_fields) = self.setup_snapshot_parsing()?;
+
+        #[derive(Default)]
+        struct SnapshotSysvars {
+            rent: Option<Rent>,
+            epoch_schedule: Option<EpochSchedule>,
+        }
+
+        let sysvars = self.process_storage_entries(
+            storage_entries,
+            SnapshotSysvars::default,
+            |local_sysvars: &mut SnapshotSysvars, account: &StoredAccountInfo| {
+                let pubkey = *account.pubkey;
+
+                if pubkey == sysvar::rent::id() {
+                    match bincode::deserialize::<Rent>(&account.data) {
+                        Ok(rent) => {
+                            local_sysvars.rent = Some(rent);
+                        }
+                        Err(err) => {
+                            warn!("Failed to deserialize rent sysvar from snapshot account: {err}");
+                        }
+                    }
+                } else if pubkey == sysvar::epoch_schedule::id() {
+                    match bincode::deserialize::<EpochSchedule>(&account.data) {
+                        Ok(epoch_schedule) => {
+                            local_sysvars.epoch_schedule = Some(epoch_schedule);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to deserialize epoch_schedule sysvar from snapshot: {err}"
+                            );
+                        }
+                    }
+                }
+            },
+            |mut a, b| {
+                if a.rent.is_none() {
+                    a.rent = b.rent;
+                }
+                if a.epoch_schedule.is_none() {
+                    a.epoch_schedule = b.epoch_schedule;
+                }
+                a
+            },
+        );
+
+        self.temp_dir = Some(temp_dir);
+
+        Ok(BankSysvarSnapshotValues {
+            bank_rent: bank_fields.rent_collector_for_snapshot().rent.clone(),
+            snapshot_rent: sysvars.rent,
+            bank_epoch_schedule: (*bank_fields.epoch_schedule_for_snapshot()).clone(),
+            snapshot_epoch_schedule: sysvars.epoch_schedule,
+        })
+    }
+}
+
+/// Values needed to compare snapshot Bank fields against their corresponding sysvar accounts.
+#[derive(Debug)]
+pub struct BankSysvarSnapshotValues {
+    /// The `Rent` configuration serialized as part of the Bank snapshot.
+    pub bank_rent: Rent,
+    /// The `Rent` configuration deserialized from the `sysvar::rent` account in the snapshot.
+    pub snapshot_rent: Option<Rent>,
+
+    /// The `EpochSchedule` from the Bank snapshot.
+    pub bank_epoch_schedule: EpochSchedule,
+    /// The `EpochSchedule` deserialized from the `sysvar::epoch_schedule` account.
+    pub snapshot_epoch_schedule: Option<EpochSchedule>,
 }
