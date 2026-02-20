@@ -113,6 +113,17 @@ enum Commands {
         #[arg(long, short = 's')]
         snapshot: PathBuf,
     },
+
+    /// Sort all accounts by size (largest first), compute prefix sums, write to file, and print power-of-2 summary
+    AccountSizePrefixSums {
+        /// Path to the snapshot archive file
+        #[arg(long, short = 's')]
+        snapshot: PathBuf,
+
+        /// Output file for full prefix sums (one line per account: rank, size_bytes, prefix_sum_bytes)
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,6 +905,75 @@ fn check_snapshot_sysvars(snapshot: PathBuf) -> Result<()> {
     }
 }
 
+fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
+    info!("Collecting account sizes from snapshot: {}", snapshot.display());
+    let mut parser = SnapshotParser::new(&snapshot);
+    let mut sizes = parser
+        .collect_account_sizes()
+        .map_err(|e| anyhow::anyhow!("Failed to collect account sizes: {}", e))?;
+
+    if sizes.is_empty() {
+        println!("No accounts found in snapshot.");
+        return Ok(());
+    }
+
+    info!("Sorting {} accounts by size (largest first)", sizes.len());
+    sizes.sort_by(|a, b| b.cmp(a));
+
+    info!("Computing prefix sums");
+    let mut prefix_sum: u64 = 0;
+    let prefix_sums: Vec<u64> = sizes
+        .iter()
+        .map(|&s| {
+            prefix_sum += s;
+            prefix_sum
+        })
+        .collect();
+
+    info!("Writing results to: {}", output.display());
+    let file = File::create(&output).map_err(|e| {
+        anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e)
+    })?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "rank,size_bytes,prefix_sum_bytes")?;
+    for (i, (&size, &psum)) in sizes.iter().zip(prefix_sums.iter()).enumerate() {
+        writeln!(writer, "{},{},{}", i + 1, size, psum)?;
+    }
+    writer.flush()?;
+
+    let total_accounts = sizes.len();
+    let total_bytes: u64 = prefix_sums.last().copied().unwrap_or(0);
+
+    println!("Account size prefix sums (largest to smallest)");
+    println!("  Total accounts: {}", total_accounts);
+    println!("  Total bytes:     {}", total_bytes);
+    println!();
+    println!("Power-of-2 prefix sum summary:");
+    println!("  {:>12}  {:>18}  {:>10}", "accounts", "prefix_sum_bytes", "pct_total");
+    let mut k: u32 = 0;
+    loop {
+        let n = (1usize << k).min(total_accounts);
+        if n == 0 {
+            break;
+        }
+        let psum = prefix_sums[n - 1];
+        let pct = if total_bytes > 0 {
+            (100.0 * psum as f64) / total_bytes as f64
+        } else {
+            0.0
+        };
+        println!("  {:>12}  {:>18}  {:>9.2}%", n, psum, pct);
+        if n >= total_accounts {
+            break;
+        }
+        k += 1;
+    }
+    println!();
+    println!("Full output written to: {}", output.display());
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     solana_logger::setup();
 
@@ -922,6 +1002,9 @@ fn main() -> Result<()> {
         }
         Commands::CheckSysvars { snapshot } => {
             check_snapshot_sysvars(snapshot)
+        }
+        Commands::AccountSizePrefixSums { snapshot, output } => {
+            account_size_prefix_sums(snapshot, output)
         }
     }
 }

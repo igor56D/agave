@@ -261,6 +261,31 @@ impl SnapshotParser {
         Ok(report)
     }
 
+    /// Collects data size (bytes) of every account in the snapshot.
+    /// Used for size distribution and prefix-sum analysis.
+    pub fn collect_account_sizes(
+        &mut self,
+    ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
+
+        let sizes = self.process_storage_entries(
+            storage_entries,
+            || Vec::<u64>::new(),
+            |local_sizes: &mut Vec<u64>, account: &StoredAccountInfo| {
+                local_sizes.push(account.data.len() as u64);
+            },
+            |mut a, mut b| {
+                a.append(&mut b);
+                a
+            },
+        );
+
+        self.temp_dir = Some(temp_dir);
+
+        info!("Collected {} account sizes", sizes.len());
+        Ok(sizes)
+    }
+
     /// Collects snapshot sysvar account values and the corresponding serialized Bank fields
     /// from the snapshot, to allow consistency checks between them.
     ///
