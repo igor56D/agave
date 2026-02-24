@@ -124,7 +124,49 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: PathBuf,
     },
+
+    /// Output a compact CSV mapping account (last 8 bytes of pubkey, hex) to account data size (u32)
+    AccountSizesCsv {
+        /// Path to the snapshot archive file
+        #[arg(long, short = 's')]
+        snapshot: PathBuf,
+
+        /// Output CSV file path (columns: pubkey_suffix_hex, size)
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+    },
+
+    /// Download the most recent full snapshot that can be discovered
+    #[command(name = "download-latest", alias = "download-nearest")]
+    DownloadNearest {
+        /// RPC URL (used for getBlockTime). SOLANA_RPC_URL env overrides default.
+        #[arg(long, default_value = DEFAULT_RPC_URL)]
+        rpc_url: String,
+
+        /// URL that returns JSON array: [{"slot", "hash", "block_time"?}]. SNAPSHOT_LIST_URL env overrides default.
+        #[arg(long, default_value = DEFAULT_SNAPSHOT_LIST_URL)]
+        snapshot_list_url: String,
+
+        /// Directory to write the downloaded snapshot archive
+        #[arg(long, default_value = ".")]
+        output_dir: PathBuf,
+
+        /// Base URL for downloading snapshot files (default: base of snapshot_list_url).
+        /// Snapshot is fetched as {download_base_url}/snapshot-{slot}-{hash}.tar.zst (or .tar.lz4)
+        #[arg(long)]
+        download_base_url: Option<String>,
+    },
 }
+
+/// Default RPC URL for mainnet-beta (used by download-nearest when not specified).
+const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+
+/// Default snapshot list URL for mainnet-beta.
+/// Must return a JSON array of {"slot": number, "hash": string, "block_time"?: number}.
+/// Override with SNAPSHOT_LIST_URL env or --snapshot-list-url (many public RPCs don't host this).
+const DEFAULT_SNAPSHOT_LIST_URL: &str =
+    "https://api.mainnet-beta.solana.com/snapshot-list.json";
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountActivityEntry {
@@ -974,6 +1016,220 @@ fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn account_sizes_csv(snapshot: PathBuf, output: PathBuf) -> Result<()> {
+    info!("Collecting account (pubkey_suffix, size) from snapshot: {}", snapshot.display());
+    let mut parser = SnapshotParser::new(&snapshot);
+    let pairs = parser
+        .collect_account_pubkey_suffix_and_size()
+        .map_err(|e| anyhow::anyhow!("Failed to collect account sizes: {}", e))?;
+
+    if pairs.is_empty() {
+        println!("No accounts found in snapshot.");
+        return Ok(());
+    }
+
+    info!("Writing CSV to: {}", output.display());
+    let file = File::create(&output)
+        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "pubkey_suffix_hex,size")?;
+    for (suffix, size) in &pairs {
+        writeln!(writer, "{:016x},{}", suffix, size)?;
+    }
+    writer.flush()?;
+    println!("Wrote {} account rows to {}", pairs.len(), output.display());
+    Ok(())
+}
+
+/// Snapshot list entry: slot, hash, optional block_time (unix timestamp)
+#[derive(serde::Deserialize)]
+struct SnapshotListEntry {
+    slot: u64,
+    hash: String,
+    #[serde(default)]
+    block_time: Option<i64>,
+}
+
+fn download_nearest(
+    rpc_url: String,
+    snapshot_list_url: String,
+    output_dir: PathBuf,
+    download_base_url: Option<String>,
+) -> Result<()> {
+    use chrono::{TimeZone, Utc};
+
+    // Allow env overrides so users can set defaults once (e.g. in .bashrc)
+    let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or(rpc_url);
+    let snapshot_list_url =
+        std::env::var("SNAPSHOT_LIST_URL").unwrap_or(snapshot_list_url);
+
+    let client = reqwest::blocking::Client::new();
+
+    // 1) Try snapshot-list endpoint first. This is the most reliable way to get slot+hash.
+    let maybe_latest_from_list: Option<(u64, String, Option<i64>)> = (|| {
+        let resp = client
+            .post(&snapshot_list_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let list: Vec<SnapshotListEntry> = resp.json().ok()?;
+        if list.is_empty() {
+            return None;
+        }
+        list.into_iter()
+            .max_by_key(|e| (e.block_time.unwrap_or(i64::MIN), e.slot))
+            .map(|e| (e.slot, e.hash, e.block_time))
+    })();
+
+    let base = download_base_url.as_deref().unwrap_or_else(|| {
+        let u = snapshot_list_url.trim_end_matches('/');
+        u.rsplit_once('/').map(|(b, _)| b).unwrap_or(u)
+    });
+    let base = base.trim_end_matches('/');
+
+    // 2) Fallback: if no usable snapshot-list, ask RPC for highest snapshot slot
+    // and scrape snapshot filenames from the download base URL to recover the hash.
+    let (slot, hash, block_time) = if let Some((slot, hash, block_time)) = maybe_latest_from_list {
+        (slot, hash, block_time)
+    } else {
+        warn!(
+            "Could not use snapshot list URL {}; trying RPC + filename discovery fallback",
+            snapshot_list_url
+        );
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getHighestSnapshotSlot",
+            "params": []
+        });
+        let resp: serde_json::Value = client
+            .post(&rpc_url)
+            .json(&body)
+            .send()
+            .map_err(|e| anyhow::anyhow!("RPC getHighestSnapshotSlot request failed: {}", e))?
+            .json()
+            .map_err(|e| anyhow::anyhow!("RPC getHighestSnapshotSlot JSON parse failed: {}", e))?;
+        let target_slot = resp
+            .get("result")
+            .and_then(|r| r.get("full"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RPC did not return getHighestSnapshotSlot.full. Response: {}",
+                    resp
+                )
+            })?;
+
+        let listing_text = client
+            .get(base)
+            .send()
+            .ok()
+            .and_then(|r| r.text().ok())
+            .unwrap_or_default();
+        let discovered = discover_snapshot_candidates(&listing_text);
+        let maybe = discovered
+            .iter()
+            .filter(|(slot, _, _)| *slot <= target_slot)
+            .max_by_key(|(slot, _, _)| *slot)
+            .or_else(|| discovered.iter().max_by_key(|(slot, _, _)| *slot))
+            .cloned();
+        let (slot, hash, _ext) = maybe.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not discover snapshot filenames from {}. \
+                 Please provide --snapshot-list-url that returns JSON entries with slot/hash.",
+                base
+            )
+        })?;
+
+        let block_time = {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlockTime",
+                "params": [slot]
+            });
+            let resp: serde_json::Value = client
+                .post(&rpc_url)
+                .json(&body)
+                .send()
+                .ok()
+                .and_then(|r| r.json().ok())
+                .unwrap_or_default();
+            resp.get("result").and_then(|v| v.as_i64())
+        };
+        (slot, hash, block_time)
+    };
+
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
+
+    let extensions = ["tar.zst", "tar.lz4"];
+    for ext in &extensions {
+        let filename = format!("snapshot-{}-{}.{}", slot, hash, ext);
+        let url = format!("{}/{}", base, filename);
+        let dest = output_dir.join(&filename);
+        info!("Trying {} -> {}", url, dest.display());
+        match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                let mut out = File::create(&dest)
+                    .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dest.display(), e))?;
+                let mut body = resp;
+                std::io::copy(&mut body, &mut out)
+                    .map_err(|e| anyhow::anyhow!("Failed to write download: {}", e))?;
+                let dt = block_time.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
+                println!(
+                    "Downloaded latest discovered snapshot slot {}{} to {}",
+                    slot,
+                    dt.map(|t| format!(" (block time {})", t.to_rfc3339()))
+                        .unwrap_or_default(),
+                    dest.display()
+                );
+                return Ok(());
+            }
+            _ => continue,
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to download snapshot for slot {} (hash {}) from {}",
+        slot,
+        hash,
+        base
+    ))
+}
+
+/// Parse a page/blob and extract snapshot filename candidates:
+/// snapshot-<slot>-<hash>.tar.zst or .tar.lz4
+fn discover_snapshot_candidates(text: &str) -> Vec<(u64, String, String)> {
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == '(' || c == ')')
+        .filter_map(|tok| {
+            let token = tok.trim_matches('/');
+            if !(token.starts_with("snapshot-")
+                && (token.ends_with(".tar.zst") || token.ends_with(".tar.lz4")))
+            {
+                return None;
+            }
+            let parts: Vec<&str> = token.split('-').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let slot = parts[1].parse::<u64>().ok()?;
+            let hash_and_ext = &parts[2..].join("-");
+            let (hash, ext) = if let Some(h) = hash_and_ext.strip_suffix(".tar.zst") {
+                (h.to_string(), "tar.zst".to_string())
+            } else if let Some(h) = hash_and_ext.strip_suffix(".tar.lz4") {
+                (h.to_string(), "tar.lz4".to_string())
+            } else {
+                return None;
+            };
+            Some((slot, hash, ext))
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     solana_logger::setup();
 
@@ -1006,5 +1262,12 @@ fn main() -> Result<()> {
         Commands::AccountSizePrefixSums { snapshot, output } => {
             account_size_prefix_sums(snapshot, output)
         }
+        Commands::AccountSizesCsv { snapshot, output } => account_sizes_csv(snapshot, output),
+        Commands::DownloadNearest {
+            rpc_url,
+            snapshot_list_url,
+            output_dir,
+            download_base_url,
+        } => download_nearest(rpc_url, snapshot_list_url, output_dir, download_base_url),
     }
 }

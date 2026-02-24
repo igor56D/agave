@@ -286,6 +286,35 @@ impl SnapshotParser {
         Ok(sizes)
     }
 
+    /// Collects (pubkey_suffix, data_size) for every account.
+    /// `pubkey_suffix` is the last 8 bytes of the pubkey (as u64 little-endian).
+    /// `data_size` is the account data length, stored as u32 (max account data is 10MB).
+    pub fn collect_account_pubkey_suffix_and_size(
+        &mut self,
+    ) -> Result<Vec<(u64, u32)>, Box<dyn std::error::Error>> {
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
+
+        let pairs = self.process_storage_entries(
+            storage_entries,
+            || Vec::<(u64, u32)>::new(),
+            |local: &mut Vec<(u64, u32)>, account: &StoredAccountInfo| {
+                let pk = account.pubkey;
+                let suffix = u64::from_le_bytes(pk.as_ref()[24..32].try_into().unwrap());
+                let size = account.data.len().min(u32::MAX as usize) as u32;
+                local.push((suffix, size));
+            },
+            |mut a, mut b| {
+                a.append(&mut b);
+                a
+            },
+        );
+
+        self.temp_dir = Some(temp_dir);
+
+        info!("Collected {} account (pubkey_suffix, size) pairs", pairs.len());
+        Ok(pairs)
+    }
+
     /// Collects snapshot sysvar account values and the corresponding serialized Bank fields
     /// from the snapshot, to allow consistency checks between them.
     ///

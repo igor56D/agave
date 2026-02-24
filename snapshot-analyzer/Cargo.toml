@@ -36,8 +36,9 @@ anyhow = { workspace = true }
 tempfile = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
 csv = { workspace = true }
+chrono = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tabled = "0.15"
 

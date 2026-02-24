@@ -339,6 +339,7 @@ version = "3.0.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "chrono",
  "clap 4.5.31",
  "csv",
  "dashmap",
