@@ -164,9 +164,7 @@ const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 /// Default snapshot list URL for mainnet-beta.
 /// Must return a JSON array of {"slot": number, "hash": string, "block_time"?: number}.
 /// Override with SNAPSHOT_LIST_URL env or --snapshot-list-url (many public RPCs don't host this).
-const DEFAULT_SNAPSHOT_LIST_URL: &str =
-    "https://api.mainnet-beta.solana.com/snapshot-list.json";
-
+const DEFAULT_SNAPSHOT_LIST_URL: &str = "https://api.mainnet-beta.solana.com/snapshot-list.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountActivityEntry {
@@ -831,24 +829,17 @@ fn report_rent_paying_accounts(snapshot: PathBuf, output: PathBuf) -> Result<()>
         return Ok(());
     }
 
-    let rent_paying_pct = (report.stats.rent_paying_accounts as f64
-        / report.stats.total_accounts as f64)
-        * 100.0;
-    let rent_exempt_accounts =
-        report.stats.total_accounts - report.stats.rent_paying_accounts;
+    let rent_paying_pct =
+        (report.stats.rent_paying_accounts as f64 / report.stats.total_accounts as f64) * 100.0;
+    let rent_exempt_accounts = report.stats.total_accounts - report.stats.rent_paying_accounts;
 
     info!(
         "Writing {} rent-paying accounts to {}",
         report.stats.rent_paying_accounts,
         output.display()
     );
-    let file = File::create(&output).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create output file {}: {}",
-            output.display(),
-            e
-        )
-    })?;
+    let file = File::create(&output)
+        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
     let mut writer = BufWriter::new(file);
     for pubkey in &report.accounts {
         writeln!(writer, "{}", pubkey)?;
@@ -868,16 +859,15 @@ fn report_rent_paying_accounts(snapshot: PathBuf, output: PathBuf) -> Result<()>
             "no"
         }
     );
-    println!("Rent-paying account addresses written to: {}", output.display());
+    println!(
+        "Rent-paying account addresses written to: {}",
+        output.display()
+    );
 
     Ok(())
 }
 
-fn print_sysvar_check(
-    name: &str,
-    matches: Option<bool>,
-    details: &str,
-) {
+fn print_sysvar_check(name: &str, matches: Option<bool>, details: &str) {
     match matches {
         Some(true) => println!("[OK]   {name}: {details}"),
         Some(false) => println!("[FAIL] {name}: {details}"),
@@ -886,7 +876,10 @@ fn print_sysvar_check(
 }
 
 fn check_snapshot_sysvars(snapshot: PathBuf) -> Result<()> {
-    info!("Checking snapshot sysvars for consistency: {}", snapshot.display());
+    info!(
+        "Checking snapshot sysvars for consistency: {}",
+        snapshot.display()
+    );
 
     let mut parser = SnapshotParser::new(&snapshot);
     let BankSysvarSnapshotValues {
@@ -948,7 +941,10 @@ fn check_snapshot_sysvars(snapshot: PathBuf) -> Result<()> {
 }
 
 fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
-    info!("Collecting account sizes from snapshot: {}", snapshot.display());
+    info!(
+        "Collecting account sizes from snapshot: {}",
+        snapshot.display()
+    );
     let mut parser = SnapshotParser::new(&snapshot);
     let mut sizes = parser
         .collect_account_sizes()
@@ -973,9 +969,8 @@ fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
         .collect();
 
     info!("Writing results to: {}", output.display());
-    let file = File::create(&output).map_err(|e| {
-        anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e)
-    })?;
+    let file = File::create(&output)
+        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
     let mut writer = BufWriter::new(file);
     writeln!(writer, "rank,size_bytes,prefix_sum_bytes")?;
     for (i, (&size, &psum)) in sizes.iter().zip(prefix_sums.iter()).enumerate() {
@@ -991,7 +986,10 @@ fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
     println!("  Total bytes:     {}", total_bytes);
     println!();
     println!("Power-of-2 prefix sum summary:");
-    println!("  {:>12}  {:>18}  {:>10}", "accounts", "prefix_sum_bytes", "pct_total");
+    println!(
+        "  {:>12}  {:>18}  {:>10}",
+        "accounts", "prefix_sum_bytes", "pct_total"
+    );
     let mut k: u32 = 0;
     loop {
         let n = (1usize << k).min(total_accounts);
@@ -1017,7 +1015,10 @@ fn account_size_prefix_sums(snapshot: PathBuf, output: PathBuf) -> Result<()> {
 }
 
 fn account_sizes_csv(snapshot: PathBuf, output: PathBuf) -> Result<()> {
-    info!("Collecting account (pubkey_suffix, size) from snapshot: {}", snapshot.display());
+    info!(
+        "Collecting account (pubkey_suffix, size) from snapshot: {}",
+        snapshot.display()
+    );
     let mut parser = SnapshotParser::new(&snapshot);
     let pairs = parser
         .collect_account_pubkey_suffix_and_size()
@@ -1060,10 +1061,25 @@ fn download_nearest(
 
     // Allow env overrides so users can set defaults once (e.g. in .bashrc)
     let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or(rpc_url);
-    let snapshot_list_url =
-        std::env::var("SNAPSHOT_LIST_URL").unwrap_or(snapshot_list_url);
+    let snapshot_list_url = std::env::var("SNAPSHOT_LIST_URL").unwrap_or(snapshot_list_url);
 
     let client = reqwest::blocking::Client::new();
+    let base = download_base_url.as_deref().unwrap_or_else(|| {
+        let u = snapshot_list_url.trim_end_matches('/');
+        u.rsplit_once('/').map(|(b, _)| b).unwrap_or(u)
+    });
+    let base = base.trim_end_matches('/');
+
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
+
+    // 0) First try static "latest snapshot" filenames.
+    // Some providers expose these without requiring slot/hash discovery.
+    let static_bases = [base, rpc_url.trim_end_matches('/')];
+    if let Some(path) = try_download_static_latest_snapshot(&client, &static_bases, &output_dir)? {
+        println!("Downloaded latest snapshot to {}", path.display());
+        return Ok(());
+    }
 
     // 1) Try snapshot-list endpoint first. This is the most reliable way to get slot+hash.
     let maybe_latest_from_list: Option<(u64, String, Option<i64>)> = (|| {
@@ -1083,12 +1099,6 @@ fn download_nearest(
             .max_by_key(|e| (e.block_time.unwrap_or(i64::MIN), e.slot))
             .map(|e| (e.slot, e.hash, e.block_time))
     })();
-
-    let base = download_base_url.as_deref().unwrap_or_else(|| {
-        let u = snapshot_list_url.trim_end_matches('/');
-        u.rsplit_once('/').map(|(b, _)| b).unwrap_or(u)
-    });
-    let base = base.trim_end_matches('/');
 
     // 2) Fallback: if no usable snapshot-list, ask RPC for highest snapshot slot
     // and scrape snapshot filenames from the download base URL to recover the hash.
@@ -1163,9 +1173,6 @@ fn download_nearest(
         (slot, hash, block_time)
     };
 
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
-
     let extensions = ["tar.zst", "tar.lz4"];
     for ext in &extensions {
         let filename = format!("snapshot-{}-{}.{}", slot, hash, ext);
@@ -1201,33 +1208,67 @@ fn download_nearest(
     ))
 }
 
+fn try_download_static_latest_snapshot(
+    client: &reqwest::blocking::Client,
+    bases: &[&str],
+    output_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    let static_names = ["snapshot.tar.zst", "snapshot.tar.lz4", "snapshot.tar.bz2"];
+    for base in bases {
+        let base = base.trim_end_matches('/');
+        for name in &static_names {
+            let url = format!("{}/{}", base, name);
+            let dest = output_dir.join(name);
+            info!(
+                "Trying static latest snapshot {} -> {}",
+                url,
+                dest.display()
+            );
+            if let Ok(resp) = client.get(&url).send() {
+                if !resp.status().is_success() {
+                    continue;
+                }
+                let mut out = File::create(&dest)
+                    .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dest.display(), e))?;
+                let mut body = resp;
+                std::io::copy(&mut body, &mut out)
+                    .map_err(|e| anyhow::anyhow!("Failed to write download: {}", e))?;
+                return Ok(Some(dest));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Parse a page/blob and extract snapshot filename candidates:
 /// snapshot-<slot>-<hash>.tar.zst or .tar.lz4
 fn discover_snapshot_candidates(text: &str) -> Vec<(u64, String, String)> {
-    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == '(' || c == ')')
-        .filter_map(|tok| {
-            let token = tok.trim_matches('/');
-            if !(token.starts_with("snapshot-")
-                && (token.ends_with(".tar.zst") || token.ends_with(".tar.lz4")))
-            {
-                return None;
-            }
-            let parts: Vec<&str> = token.split('-').collect();
-            if parts.len() < 3 {
-                return None;
-            }
-            let slot = parts[1].parse::<u64>().ok()?;
-            let hash_and_ext = &parts[2..].join("-");
-            let (hash, ext) = if let Some(h) = hash_and_ext.strip_suffix(".tar.zst") {
-                (h.to_string(), "tar.zst".to_string())
-            } else if let Some(h) = hash_and_ext.strip_suffix(".tar.lz4") {
-                (h.to_string(), "tar.lz4".to_string())
-            } else {
-                return None;
-            };
-            Some((slot, hash, ext))
-        })
-        .collect()
+    text.split(|c: char| {
+        c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>' || c == '(' || c == ')'
+    })
+    .filter_map(|tok| {
+        let token = tok.trim_matches('/');
+        if !(token.starts_with("snapshot-")
+            && (token.ends_with(".tar.zst") || token.ends_with(".tar.lz4")))
+        {
+            return None;
+        }
+        let parts: Vec<&str> = token.split('-').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let slot = parts[1].parse::<u64>().ok()?;
+        let hash_and_ext = &parts[2..].join("-");
+        let (hash, ext) = if let Some(h) = hash_and_ext.strip_suffix(".tar.zst") {
+            (h.to_string(), "tar.zst".to_string())
+        } else if let Some(h) = hash_and_ext.strip_suffix(".tar.lz4") {
+            (h.to_string(), "tar.lz4".to_string())
+        } else {
+            return None;
+        };
+        Some((slot, hash, ext))
+    })
+    .collect()
 }
 
 fn main() -> Result<()> {
@@ -1253,12 +1294,8 @@ fn main() -> Result<()> {
             output,
             false_rate,
         } => create_bloom_filter(snapshot, output, false_rate),
-        Commands::RentPaying { snapshot, output } => {
-            report_rent_paying_accounts(snapshot, output)
-        }
-        Commands::CheckSysvars { snapshot } => {
-            check_snapshot_sysvars(snapshot)
-        }
+        Commands::RentPaying { snapshot, output } => report_rent_paying_accounts(snapshot, output),
+        Commands::CheckSysvars { snapshot } => check_snapshot_sysvars(snapshot),
         Commands::AccountSizePrefixSums { snapshot, output } => {
             account_size_prefix_sums(snapshot, output)
         }

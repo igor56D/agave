@@ -121,6 +121,16 @@ cargo build --release -p agave-snapshot-analyzer
 
 See `snapshot-analyzer/templates/README.md` for details and examples.
 
+## Python CSV Analysis
+
+For matplotlib-based analysis of slot CSV output (`slot,account_count,missing_account_count,total_data_size_bytes`), use:
+
+```bash
+python3 snapshot-analyzer/analysis/analyze_output_csv.py --input output.csv
+```
+
+See `snapshot-analyzer/analysis/README.md` for generated plots and report files.
+
 ### Staleness Analysis
 
 ```bash
