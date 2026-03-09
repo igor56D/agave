@@ -263,9 +263,7 @@ impl SnapshotParser {
 
     /// Collects data size (bytes) of every account in the snapshot.
     /// Used for size distribution and prefix-sum analysis.
-    pub fn collect_account_sizes(
-        &mut self,
-    ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    pub fn collect_account_sizes(&mut self) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
         let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
 
         let sizes = self.process_storage_entries(
@@ -311,7 +309,10 @@ impl SnapshotParser {
 
         self.temp_dir = Some(temp_dir);
 
-        info!("Collected {} account (pubkey_suffix, size) pairs", pairs.len());
+        info!(
+            "Collected {} account (pubkey_suffix, size) pairs",
+            pairs.len()
+        );
         Ok(pairs)
     }
 
