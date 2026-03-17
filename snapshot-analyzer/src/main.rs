@@ -385,17 +385,25 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
     "#,
     )?;
 
-    info!("Loading snapshot...");
+    info!("Table created, initializing parser...");
     let mut parser = SnapshotParser::new(&snapshot);
+    info!("Parser initialized, starting parse_all_pubkeys...");
 
     // Parse all pubkeys, then get metadata for all of them
     let all_pubkeys = parser
         .parse_all_pubkeys()
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
-    info!("Found {} pubkeys in snapshot", all_pubkeys.len());
+    info!(
+        "parse_all_pubkeys completed, found {} pubkeys in snapshot",
+        all_pubkeys.len()
+    );
 
     // Create a dummy activity map with all pubkeys to get all account metadata
+    info!(
+        "Creating dummy activity map for {} pubkeys...",
+        all_pubkeys.len()
+    );
     let dummy_activity_map: HashMap<Pubkey, AccountActivity> = all_pubkeys
         .iter()
         .map(|pk| {
@@ -411,11 +419,19 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
         })
         .collect();
 
+    info!(
+        "Dummy activity map created with {} entries, starting parse_accounts...",
+        dummy_activity_map.len()
+    );
+
     let account_metadata = parser
         .parse_accounts(&dummy_activity_map)
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
-    info!("Inserting data into database...");
+    info!(
+        "parse_accounts completed, got metadata for {} accounts",
+        account_metadata.len()
+    );
 
     // Speed up inserts further by disabling analysis during load
     conn.execute_batch(
@@ -425,6 +441,7 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
     "#,
     )?;
 
+    info!("Starting database transaction...");
     // Use a single large transaction for maximum speed
     let tx = conn.transaction()?;
 
@@ -435,6 +452,10 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
     "#,
     )?;
 
+    info!(
+        "Prepared insert statement, starting insertion of {} accounts...",
+        account_metadata.len()
+    );
     let mut inserted = 0;
 
     for (pubkey, metadata) in &account_metadata {
@@ -454,6 +475,10 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
         }
     }
 
+    info!(
+        "All {} accounts inserted, committing transaction...",
+        inserted
+    );
     // Commit the entire transaction
     drop(stmt);
     tx.commit()?;

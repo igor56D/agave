@@ -54,11 +54,17 @@ impl SnapshotParser {
         ),
         Box<dyn std::error::Error>,
     > {
-        info!("Parsing snapshot: {}", self.snapshot_path.display());
+        info!(
+            "setup_snapshot_parsing: parsing snapshot: {}",
+            self.snapshot_path.display()
+        );
 
         // Parse the snapshot archive info
         let archive_info = FullSnapshotArchiveInfo::new_from_path(self.snapshot_path.clone())?;
-        info!("Found snapshot with slot: {}", archive_info.slot());
+        info!(
+            "setup_snapshot_parsing: found snapshot with slot: {}",
+            archive_info.slot()
+        );
 
         // Create temporary directory for unpacking
         let temp_dir = tempfile::TempDir::new()?;
@@ -71,7 +77,7 @@ impl SnapshotParser {
             std::fs::create_dir_all(path)?;
         }
 
-        info!("Unpacking snapshot...");
+        info!("setup_snapshot_parsing: created temp directories, starting snapshot unpacking...");
 
         // Unarchive the snapshot
         let (unarchived_snapshots, _guard) = verify_and_unarchive_snapshots(
@@ -82,7 +88,7 @@ impl SnapshotParser {
             StorageAccess::File,
         )?;
 
-        info!("Snapshot unpacked");
+        info!("setup_snapshot_parsing: snapshot unpacked successfully");
 
         // Collect storage entries to process
         let storage_entries: Vec<_> = unarchived_snapshots
@@ -96,7 +102,7 @@ impl SnapshotParser {
         let bank_fields = unarchived_snapshots.bank_fields.collapse_into();
 
         info!(
-            "Processing {} storage entries with 32 parallel threads",
+            "setup_snapshot_parsing: collected {} storage entries, ready for processing",
             storage_entries.len()
         );
 
@@ -159,7 +165,16 @@ impl SnapshotParser {
         &mut self,
         activity_map: &HashMap<Pubkey, crate::AccountActivity>,
     ) -> Result<HashMap<Pubkey, crate::AccountMetadata>, Box<dyn std::error::Error>> {
+        info!(
+            "Starting parse_accounts with activity_map containing {} entries...",
+            activity_map.len()
+        );
         let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
+        info!(
+            "parse_accounts: snapshot parsing setup complete, processing {} storage entries...",
+            storage_entries.len()
+        );
+
         let result = self.process_storage_entries(
             storage_entries,
             || HashMap::<Pubkey, crate::AccountMetadata>::new(),
@@ -185,13 +200,21 @@ impl SnapshotParser {
         // Store temp_dir to keep it alive
         self.temp_dir = Some(temp_dir);
 
-        info!("Found {} tracked accounts", result.len());
+        info!(
+            "parse_accounts completed: found {} tracked accounts",
+            result.len()
+        );
         Ok(result)
     }
 
     /// Parse all pubkeys from the snapshot (not filtered by activity index)
     pub fn parse_all_pubkeys(&mut self) -> Result<Vec<Pubkey>, Box<dyn std::error::Error>> {
+        info!("Starting parse_all_pubkeys: setting up snapshot parsing...");
         let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
+        info!(
+            "Snapshot parsing setup complete, processing {} storage entries...",
+            storage_entries.len()
+        );
 
         let result = self.process_storage_entries(
             storage_entries,
@@ -208,7 +231,10 @@ impl SnapshotParser {
         // Store temp_dir to keep it alive
         self.temp_dir = Some(temp_dir);
 
-        info!("Found {} total pubkeys", result.len());
+        info!(
+            "parse_all_pubkeys completed: found {} total pubkeys",
+            result.len()
+        );
         Ok(result)
     }
 
