@@ -53,6 +53,10 @@ enum Commands {
         /// Create database of accounts in index but not in snapshot (index-only accounts)
         #[arg(long)]
         index_only: bool,
+
+        /// Create database of snapshot accounts only (without activity index data)
+        #[arg(long)]
+        snapshot_only: bool,
     },
 
     /// Run SQL query on database
@@ -197,6 +201,7 @@ fn create_database(
     index: PathBuf,
     output: PathBuf,
     index_only: bool,
+    snapshot_only: bool,
 ) -> Result<()> {
     info!("Creating database at: {}", output.display());
 
@@ -226,9 +231,11 @@ fn create_database(
     )?;
 
     if index_only {
-        return create_index_only_database(conn, snapshot, index);
+        create_index_only_database(conn, snapshot, index)
+    } else if snapshot_only {
+        create_snapshot_only_database(conn, snapshot)
     } else {
-        return create_standard_database(conn, snapshot, index);
+        create_standard_database(conn, snapshot, index)
     }
 }
 
@@ -359,6 +366,103 @@ fn create_index_only_database(
         inserted
     );
     println!("Index-only accounts added: {}", inserted);
+    Ok(())
+}
+
+fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Result<()> {
+    info!("Creating snapshot-only database (accounts from snapshot without activity index)");
+
+    // Create the snapshot-only accounts table
+    conn.execute_batch(
+        r#"
+        CREATE TABLE accounts (
+            account TEXT PRIMARY KEY,
+            account_size INTEGER,
+            lamports INTEGER,
+            owner TEXT,
+            executable INTEGER
+        );
+    "#,
+    )?;
+
+    info!("Loading snapshot...");
+    let mut parser = SnapshotParser::new(&snapshot);
+
+    // Parse all pubkeys, then get metadata for all of them
+    let all_pubkeys = parser
+        .parse_all_pubkeys()
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
+
+    info!("Found {} pubkeys in snapshot", all_pubkeys.len());
+
+    // Create a dummy activity map with all pubkeys to get all account metadata
+    let dummy_activity_map: HashMap<Pubkey, AccountActivity> = all_pubkeys
+        .iter()
+        .map(|pk| {
+            (
+                *pk,
+                AccountActivity {
+                    top_read_epochs: vec![],
+                    top_write_epochs: vec![],
+                    read_count: 0,
+                    write_count: 0,
+                },
+            )
+        })
+        .collect();
+
+    let account_metadata = parser
+        .parse_accounts(&dummy_activity_map)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
+
+    info!("Inserting data into database...");
+
+    // Speed up inserts further by disabling analysis during load
+    conn.execute_batch(
+        r#"
+        PRAGMA analysis_limit=0;
+        PRAGMA optimize;
+    "#,
+    )?;
+
+    // Use a single large transaction for maximum speed
+    let tx = conn.transaction()?;
+
+    // Prepare statement once
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO accounts VALUES (?, ?, ?, ?, ?)
+    "#,
+    )?;
+
+    let mut inserted = 0;
+
+    for (pubkey, metadata) in &account_metadata {
+        stmt.execute((
+            &pubkey.to_string(),
+            metadata.data_size as i64,
+            metadata.lamports as i64,
+            &metadata.owner.to_string(),
+            metadata.executable as i32,
+        ))?;
+
+        inserted += 1;
+
+        // Progress reporting every 50k accounts
+        if inserted % 50000 == 0 {
+            info!("Inserted {} accounts...", inserted);
+        }
+    }
+
+    // Commit the entire transaction
+    drop(stmt);
+    tx.commit()?;
+
+    info!(
+        "Snapshot-only database created successfully with {} accounts",
+        inserted
+    );
+    println!("Snapshot-only database created: {} accounts", inserted);
     Ok(())
 }
 
@@ -676,6 +780,12 @@ fn apply_default_params(template_name: &str, param_map: &mut HashMap<String, Str
         }
         "index_only_random_accounts" => {
             param_map.entry("n".to_string()).or_insert("20".to_string());
+        }
+        "fee_payers" => {
+            // No parameters needed for fee_payers
+        }
+        "nonce_accounts" => {
+            // owner parameter is required - no default
         }
         _ => {
             // No defaults for unknown templates
@@ -1282,7 +1392,8 @@ fn main() -> Result<()> {
             index,
             output,
             index_only,
-        } => create_database(snapshot, index, output, index_only),
+            snapshot_only,
+        } => create_database(snapshot, index, output, index_only, snapshot_only),
         Commands::Query { database, query } => run_query(database, query),
         Commands::RunQuery {
             database,
