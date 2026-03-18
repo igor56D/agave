@@ -207,6 +207,48 @@ impl SnapshotParser {
         Ok(result)
     }
 
+    /// Parse all accounts from the snapshot without filtering (single pass for efficiency)
+    /// Returns a HashMap of all pubkeys to their account metadata
+    pub fn parse_all_accounts(
+        &mut self,
+    ) -> Result<HashMap<Pubkey, crate::AccountMetadata>, Box<dyn std::error::Error>> {
+        info!("Starting parse_all_accounts: setting up snapshot parsing (single pass)...");
+        let (temp_dir, storage_entries, _bank_fields) = self.setup_snapshot_parsing()?;
+        info!(
+            "Snapshot parsing setup complete, processing {} storage entries...",
+            storage_entries.len()
+        );
+
+        let result = self.process_storage_entries(
+            storage_entries,
+            || HashMap::<Pubkey, crate::AccountMetadata>::new(),
+            |local_accounts: &mut HashMap<Pubkey, crate::AccountMetadata>,
+             account: &StoredAccountInfo| {
+                let pubkey = *account.pubkey;
+                let metadata = crate::AccountMetadata {
+                    lamports: account.lamports,
+                    owner: *account.owner,
+                    executable: account.executable,
+                    data_size: account.data.len() as u64,
+                };
+                local_accounts.insert(pubkey, metadata);
+            },
+            |mut a, b| {
+                a.extend(b);
+                a
+            },
+        );
+
+        // Store temp_dir to keep it alive
+        self.temp_dir = Some(temp_dir);
+
+        info!(
+            "parse_all_accounts completed: found {} total accounts",
+            result.len()
+        );
+        Ok(result)
+    }
+
     /// Parse all pubkeys from the snapshot (not filtered by activity index)
     pub fn parse_all_pubkeys(&mut self) -> Result<Vec<Pubkey>, Box<dyn std::error::Error>> {
         info!("Starting parse_all_pubkeys: setting up snapshot parsing...");

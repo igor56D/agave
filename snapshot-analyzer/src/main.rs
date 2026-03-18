@@ -387,49 +387,15 @@ fn create_snapshot_only_database(mut conn: Connection, snapshot: PathBuf) -> Res
 
     info!("Table created, initializing parser...");
     let mut parser = SnapshotParser::new(&snapshot);
-    info!("Parser initialized, starting parse_all_pubkeys...");
+    info!("Parser initialized, starting single-pass account parsing...");
 
-    // Parse all pubkeys, then get metadata for all of them
-    let all_pubkeys = parser
-        .parse_all_pubkeys()
-        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
-
-    info!(
-        "parse_all_pubkeys completed, found {} pubkeys in snapshot",
-        all_pubkeys.len()
-    );
-
-    // Create a dummy activity map with all pubkeys to get all account metadata
-    info!(
-        "Creating dummy activity map for {} pubkeys...",
-        all_pubkeys.len()
-    );
-    let dummy_activity_map: HashMap<Pubkey, AccountActivity> = all_pubkeys
-        .iter()
-        .map(|pk| {
-            (
-                *pk,
-                AccountActivity {
-                    top_read_epochs: vec![],
-                    top_write_epochs: vec![],
-                    read_count: 0,
-                    write_count: 0,
-                },
-            )
-        })
-        .collect();
-
-    info!(
-        "Dummy activity map created with {} entries, starting parse_accounts...",
-        dummy_activity_map.len()
-    );
-
+    // Use single-pass parsing to avoid unpacking snapshot twice
     let account_metadata = parser
-        .parse_accounts(&dummy_activity_map)
+        .parse_all_accounts()
         .map_err(|e| anyhow::anyhow!("Failed to parse snapshot: {}", e))?;
 
     info!(
-        "parse_accounts completed, got metadata for {} accounts",
+        "Single-pass parsing completed, got metadata for {} accounts",
         account_metadata.len()
     );
 
